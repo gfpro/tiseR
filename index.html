@@ -1,0 +1,635 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tiseR</title>
+<style>
+  :root{
+    --bg:#ffffff; --surface:#f9fafb; --surface2:#f3f4f6; --border:#e5e7eb;
+    --text:#111827; --muted:#6b7280; --muted2:#9ca3af;
+    --accent:#2563eb; --accent-light:#eff6ff; --accent-dark:#1d4ed8;
+    --user-bg:#1e293b; --user-text:#f8fafc;
+    --shadow:0 1px 3px rgba(0,0,0,.06),0 1px 2px rgba(0,0,0,.04);
+    --shadow-md:0 4px 16px rgba(0,0,0,.06),0 1px 4px rgba(0,0,0,.04);
+    --r:12px; --r-sm:8px;
+    --sans:ui-sans-serif,"Segoe UI",system-ui,-apple-system,sans-serif;
+    --mono:ui-monospace,"Cascadia Code","Consolas",monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0;}
+  html,body{height:100%;overflow:hidden;}
+  body{font-family:var(--sans);color:var(--text);background:var(--bg);display:flex;}
+
+  /* ── Sidebar ───────────────────────────────────────────────── */
+  #sidebar{
+    width:56px;flex:none;display:flex;flex-direction:column;align-items:center;
+    gap:4px;padding:12px 0;background:var(--bg);border-right:1px solid var(--border);
+    z-index:10;
+  }
+  .sb-logo{
+    width:36px;height:36px;border-radius:10px;background:var(--accent);color:#fff;
+    display:grid;place-items:center;font-weight:800;font-size:13px;letter-spacing:-.02em;
+    margin-bottom:12px;
+  }
+  .sb-btn{
+    width:36px;height:36px;border:0;background:transparent;border-radius:var(--r-sm);
+    color:var(--muted);cursor:pointer;display:grid;place-items:center;transition:background .12s,color .12s;
+    position:relative;
+  }
+  .sb-btn:hover{background:var(--surface);color:var(--text);}
+  .sb-btn.active{background:var(--accent-light);color:var(--accent);}
+  .sb-btn svg{width:18px;height:18px;}
+  .badge{
+    position:absolute;top:2px;right:2px;width:16px;height:16px;border-radius:99px;
+    background:var(--accent);color:#fff;font-family:var(--mono);font-size:9px;
+    display:grid;place-items:center;font-weight:700;
+  }
+  .badge.hidden{display:none;}
+
+  /* ── Main ──────────────────────────────────────────────────── */
+  #main{flex:1;display:flex;flex-direction:column;min-width:0;overflow:hidden;}
+
+  /* ── Header ────────────────────────────────────────────────── */
+  #header{
+    height:52px;flex:none;display:flex;align-items:center;gap:12px;padding:0 20px;
+    border-bottom:1px solid var(--border);background:var(--bg);z-index:5;
+  }
+  #header .title{font-weight:600;font-size:15px;color:var(--text);}
+  #header .subtitle{font-size:12px;color:var(--muted);}
+  select#model{
+    margin-left:auto;border:1px solid var(--border);border-radius:var(--r-sm);
+    padding:5px 10px;font-family:var(--mono);font-size:11px;
+    color:var(--text);background:var(--bg);cursor:pointer;
+  }
+  #loadModelBtn{
+    border:1px solid var(--border);border-radius:var(--r-sm);background:var(--bg);
+    color:var(--accent);cursor:pointer;font-family:var(--mono);font-size:11px;
+    padding:5px 10px;transition:background .12s;
+  }
+  #loadModelBtn:hover{background:var(--accent-light);}
+  #loadModelBtn:disabled{color:var(--muted2);cursor:default;background:var(--bg);}
+  #loadModelBtn.loaded{color:var(--accent);border-color:var(--accent);background:var(--accent-light);}
+  .status-pill{
+    display:flex;align-items:center;gap:7px;padding:5px 12px;border:1px solid var(--border);
+    border-radius:99px;font-family:var(--mono);font-size:11px;color:var(--muted);
+    background:var(--surface);white-space:nowrap;
+  }
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--border);}
+  .dot.ok{background:var(--accent);}
+  .dot.busy{background:#f59e0b;animation:pulse 1s infinite;}
+  @keyframes pulse{50%{opacity:.35;}}
+
+  /* ── Doc Modal ─────────────────────────────────────────────── */
+  #doc-overlay{
+    display:none;position:fixed;inset:0;z-index:50;
+    background:rgba(17,24,39,.38);backdrop-filter:blur(2px);
+    align-items:flex-start;justify-content:center;padding:64px 16px;
+  }
+  #doc-overlay.open{display:flex;}
+  .doc-modal{
+    width:100%;max-width:560px;max-height:calc(100vh - 128px);
+    background:var(--bg);border:1px solid var(--border);border-radius:var(--r);
+    box-shadow:var(--shadow-md);display:flex;flex-direction:column;overflow:hidden;
+  }
+  .dm-head{
+    display:flex;align-items:center;gap:10px;padding:16px 18px;border-bottom:1px solid var(--border);
+  }
+  .dm-head h3{font-size:15px;font-weight:600;color:var(--text);}
+  .dm-head .count{font-family:var(--mono);font-size:11px;color:var(--muted);}
+  .dm-close{
+    margin-left:auto;width:30px;height:30px;border:0;background:transparent;border-radius:var(--r-sm);
+    color:var(--muted);cursor:pointer;display:grid;place-items:center;transition:background .12s,color .12s;
+  }
+  .dm-close:hover{background:var(--surface);color:var(--text);}
+  .dm-close svg{width:16px;height:16px;}
+  .dm-body{padding:14px 18px 18px;overflow-y:auto;}
+  .dm-section-label{
+    font-family:var(--mono);font-size:10px;text-transform:uppercase;letter-spacing:.08em;
+    color:var(--muted);margin:4px 0 8px;
+  }
+  /* Dokumentliste */
+  #doc-list{display:flex;flex-direction:column;gap:6px;margin-bottom:18px;}
+  .doc-row{
+    display:flex;align-items:center;gap:10px;padding:9px 12px;background:var(--surface);
+    border:1px solid var(--border);border-radius:var(--r-sm);
+  }
+  .doc-row .dr-icon{width:16px;height:16px;color:var(--accent);flex:none;}
+  .doc-row .dr-name{font-size:13px;color:var(--text);font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .doc-row .dr-meta{margin-left:auto;font-family:var(--mono);font-size:10px;color:var(--muted);white-space:nowrap;}
+  .doc-row .dr-del{
+    width:26px;height:26px;border:0;background:transparent;border-radius:6px;color:var(--muted2);
+    cursor:pointer;display:grid;place-items:center;flex:none;transition:background .12s,color .12s;
+  }
+  .doc-row .dr-del:hover{background:#fef2f2;color:#dc2626;}
+  .doc-row .dr-del svg{width:14px;height:14px;}
+  #doc-list-empty{font-size:13px;color:var(--muted2);padding:10px 2px;}
+
+  /* Upload-Bereich (klar abgesetzt, eine Aktion pro Zeile) */
+  .dm-upload{border-top:1px solid var(--border);padding-top:16px;display:flex;flex-direction:column;gap:10px;}
+  .up-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap;}
+  input[type=file]{font-size:12px;color:var(--text);flex:1;min-width:0;}
+  .dp-btn{
+    border:0;border-radius:var(--r-sm);background:var(--accent);color:#fff;cursor:pointer;
+    font-family:var(--mono);font-size:11px;letter-spacing:.04em;padding:8px 14px;
+    transition:opacity .12s;white-space:nowrap;
+  }
+  .dp-btn:hover{opacity:.88;} .dp-btn:disabled{opacity:.45;cursor:default;}
+  .dp-btn.ghost{background:transparent;border:1px solid var(--border);color:var(--text);}
+  .dp-btn.danger{background:transparent;border:1px solid #fca5a5;color:#dc2626;}
+  .dm-foot{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-top:6px;}
+  #doc-report{
+    flex:1;font-family:var(--mono);font-size:11px;color:var(--muted);line-height:1.6;
+  }
+  #doc-report.err{color:#dc2626;}
+  .fmt-hint{font-family:var(--mono);font-size:10px;color:var(--muted2);}
+
+  /* ── Chat area ─────────────────────────────────────────────── */
+  #chat-wrap{flex:1;overflow-y:auto;padding:28px 0 12px;}
+
+  /* Welcome */
+  #welcome{
+    display:flex;flex-direction:column;align-items:center;justify-content:center;
+    min-height:calc(100vh - 220px);text-align:center;padding:20px;gap:10px;
+  }
+  .wl-icon{
+    width:56px;height:56px;border-radius:16px;background:var(--accent);color:#fff;
+    display:grid;place-items:center;margin-bottom:8px;
+  }
+  .wl-icon svg{width:28px;height:28px;}
+  #welcome h2{font-size:22px;font-weight:600;color:var(--text);letter-spacing:-.02em;}
+  #welcome p{font-size:14px;color:var(--muted);max-width:40ch;line-height:1.6;}
+
+  /* Messages */
+  #messages{max-width:720px;margin:0 auto;padding:0 20px;display:flex;flex-direction:column;gap:20px;}
+  .msg{display:flex;flex-direction:column;gap:6px;}
+  .msg.user{align-items:flex-end;}
+  .msg-meta{display:flex;align-items:center;gap:8px;}
+  .msg.user .msg-meta{justify-content:flex-end;}
+  .avatar{
+    width:26px;height:26px;border-radius:8px;background:var(--accent);color:#fff;
+    display:grid;place-items:center;font-size:10px;font-weight:700;flex:none;
+  }
+  .avatar.user-av{background:var(--user-bg);}
+  .avatar svg{width:14px;height:14px;}
+  .msg-name{font-family:var(--mono);font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);}
+  .bubble{padding:12px 16px;border-radius:var(--r);line-height:1.65;white-space:pre-wrap;word-wrap:break-word;font-size:14.5px;}
+  .msg.user .bubble{background:var(--user-bg);color:var(--user-text);border-bottom-right-radius:4px;max-width:78%;}
+  .msg.bot .bubble{background:var(--surface);border:1px solid var(--border);border-bottom-left-radius:4px;max-width:88%;}
+  .msg.bot.chatmode .bubble{background:#f0faf4;border-color:#c4ddd1;}
+  .msg.bot.empty .bubble{color:var(--muted2);}
+  .typing{display:inline-flex;gap:4px;align-items:center;}
+  .typing i{width:6px;height:6px;border-radius:50%;background:var(--muted2);animation:bounce 1.2s infinite;}
+  .typing i:nth-child(2){animation-delay:.15s;} .typing i:nth-child(3){animation-delay:.3s;}
+  @keyframes bounce{0%,60%,100%{transform:translateY(0);opacity:.4;}30%{transform:translateY(-5px);opacity:1;}}
+  details.src{margin-top:6px;}
+  details.src summary{font-family:var(--mono);font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:var(--accent);cursor:pointer;list-style:none;padding:4px 0;}
+  details.src summary::-webkit-details-marker{display:none;}
+  /* ── tiseR Wordmark ───────────────────────────────────────────── */
+  .tiser-wordmark{
+    display:inline-flex;align-items:center;
+    font-weight:800;letter-spacing:-.03em;line-height:1;
+    font-size:15px;
+  }
+  .tiser-wordmark .part-tise{color:var(--accent);}
+  .tiser-wordmark .part-r{
+    display:inline-flex;align-items:center;justify-content:center;
+    background:var(--accent);color:#fff;
+    border-radius:3px;
+    height:1.25em;min-width:1.05em;
+    font-size:inherit;font-weight:800;
+    padding:0 3px;
+    margin-left:4px;
+    position:relative;top:-.04em;
+    letter-spacing:0;
+  }
+
+  .chip{margin-top:6px;padding:8px 12px;background:var(--accent-light);border:1px solid #c4ddd1;border-radius:var(--r-sm);font-size:12px;line-height:1.5;color:var(--accent-dark);}
+  .chip b{font-family:var(--mono);font-size:10px;}
+
+  /* ── Input bar ─────────────────────────────────────────────── */
+  #input-area{
+    flex:none;padding:14px 20px 18px;background:var(--bg);border-top:1px solid var(--border);
+  }
+  #input-box{
+    max-width:720px;margin:0 auto;display:flex;gap:8px;align-items:flex-end;
+    background:var(--surface);border:1px solid var(--border);border-radius:var(--r);
+    padding:8px 8px 8px 12px;box-shadow:var(--shadow);
+  }
+  .ib-btn{
+    width:34px;height:34px;border:0;border-radius:var(--r-sm);background:transparent;
+    color:var(--muted);cursor:pointer;display:grid;place-items:center;transition:background .12s,color .12s;flex:none;
+  }
+  .ib-btn:hover{background:var(--surface2);color:var(--text);}
+  .ib-btn.send{background:var(--accent);color:#fff;} .ib-btn.send:hover{background:var(--accent-dark);}
+  .ib-btn.send:disabled{opacity:.45;cursor:default;background:var(--accent);}
+  .ib-btn svg{width:17px;height:17px;}
+  textarea{flex:1;border:0;background:transparent;resize:none;font:14.5px/1.5 var(--sans);
+    color:var(--text);max-height:130px;padding:5px 0;outline:none;}
+  textarea::placeholder{color:var(--muted2);}
+  #mode-hint{max-width:720px;margin:6px auto 0;font-family:var(--mono);font-size:10px;
+    text-transform:uppercase;letter-spacing:.07em;color:var(--muted2);text-align:center;}
+
+  /* Progress bar */
+  #bar{position:fixed;top:0;left:0;height:2px;background:var(--accent);width:0;z-index:100;transition:width .2s;opacity:0;}
+  #bar.on{opacity:1;}
+</style>
+</head>
+<body>
+
+<div id="bar"></div>
+
+<!-- Sidebar -->
+<aside id="sidebar">
+  <div class="sb-logo">
+    <svg viewBox="0 0 24 24" width="18" height="18"><path d="M12 2.5 L4.5 5.5 V11 c0 4.6 3.1 8 7.5 9.5 c4.4 -1.5 7.5 -4.9 7.5 -9.5 V5.5 Z" fill="currentColor"/><polygon points="12.6 6.5 8 13 11.3 13 10.4 17.5 15.5 11 11.8 11" fill="var(--accent)"/></svg>
+  </div>
+
+  <button class="sb-btn" id="newChatBtn" title="Neuer Chat">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 013 3L7 19l-4 1 1-4 12.5-12.5z"/>
+    </svg>
+  </button>
+
+  <button class="sb-btn" id="docBtn" title="Dokumente">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/>
+    </svg>
+    <span class="badge hidden" id="badge">0</span>
+  </button>
+</aside>
+
+<!-- Main -->
+<div id="main">
+  <!-- Header -->
+  <div id="header">
+    <span class="title">
+      <span class="tiser-wordmark"><span class="part-tise">tise</span><span class="part-r">R</span></span>
+    </span>
+    <span class="subtitle" id="subtitle">tiny secure RAG · 100% lokal</span>
+    <select id="model"></select>
+    <button id="loadModelBtn" title="Modell vorab laden">Modell laden</button>
+    <div class="status-pill"><span class="dot" id="dot"></span><span id="status">initialisiere…</span></div>
+  </div>
+
+  <!-- Doc modal (overlay) -->
+  <div id="doc-overlay">
+    <div class="doc-modal" role="dialog" aria-modal="true">
+      <div class="dm-head">
+        <h3>Dokumente</h3>
+        <span class="count" id="dm-count"></span>
+        <button class="dm-close" id="dmClose" title="Schliessen">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+      <div class="dm-body">
+        <div class="dm-section-label">Indizierte Dokumente</div>
+        <div id="doc-list"></div>
+        <div id="doc-list-empty">Noch keine Dokumente indiziert.</div>
+
+        <div class="dm-upload">
+          <div class="dm-section-label">Hinzufügen</div>
+          <div class="up-row">
+            <input type="file" id="files" accept=".pdf,.docx,.xlsx,.pptx,.csv,.txt,.eml,.msg" multiple>
+            <button class="dp-btn" id="ingestBtn">Laden</button>
+          </div>
+          <div class="up-row">
+            <button class="dp-btn ghost" id="folderBtn">Ordner data\ einlesen</button>
+            <button class="dp-btn danger" id="resetBtn">Alle löschen</button>
+            <span class="fmt-hint">PDF · DOCX · XLSX · PPTX · CSV · TXT · EML · MSG</span>
+          </div>
+          <div class="dm-foot">
+            <div id="doc-report"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+
+  <!-- Chat -->
+  <div id="chat-wrap">
+    <div id="welcome">
+      <div class="wl-icon">
+        <svg viewBox="0 0 24 24"><path d="M12 2.5 L4.5 5.5 V11 c0 4.6 3.1 8 7.5 9.5 c4.4 -1.5 7.5 -4.9 7.5 -9.5 V5.5 Z" fill="currentColor"/><polygon points="12.6 6.5 8 13 11.3 13 10.4 17.5 15.5 11 11.8 11" fill="var(--accent)"/></svg>
+      </div>
+      <h2>Wie kann ich helfen?</h2>
+      <p>Stelle eine Frage — oder lade Dokumente für die semantische Suche (RAG-Modus).</p>
+    </div>
+    <div id="messages"></div>
+  </div>
+
+  <!-- Input -->
+  <div id="input-area">
+    <div id="input-box">
+      <button class="ib-btn" id="plusBtn" title="Dokumente verwalten">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+      </button>
+      <textarea id="q" rows="1" placeholder="tiseR fragen oder Dokumente laden…"></textarea>
+      <button class="ib-btn send" id="askBtn" title="Senden">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+      </button>
+    </div>
+    <div id="mode-hint">100 % lokal · kein Dokument geladen · Chat-Modus</div>
+  </div>
+</div>
+
+<script type="module">
+// ── Prompts ──────────────────────────────────────────────────────────────────
+const PROMPT_RAG  = "Du bist ein präziser RAG-Assistent. Antworte auf Deutsch, nur auf Basis der bereitgestellten Dokumente. Du darfst Informationen aus mehreren Stellen kombinieren und zusammenfassen. Enthalten die Dokumente keine Grundlage für die Antwort, sage das offen (z. B. 'Dazu enthalten die Dokumente keine Angabe'). Erfinde keine Fakten.";
+const PROMPT_CHAT = "Du bist ein klarer, präziser Berater. Antworte auf Deutsch. Formuliere direkt, ohne Füllwörter. Wenn du etwas nicht weisst, sage es offen.";
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+const $ = id => document.getElementById(id);
+const setStatus = (t, cls) => { $("status").textContent = t; $("dot").className = "dot" + (cls ? " "+cls : ""); };
+const bar = pct => { const b = $("bar"); if(pct==null){b.classList.remove("on");b.style.width="0";}else{b.classList.add("on");b.style.width=Math.max(3,pct)+"%";} };
+
+// ── Worker RPC ───────────────────────────────────────────────────────────────
+function makeWorker(url, onStatus){
+  const w = new Worker(url);
+  const waiters = new Map(); let ready = null;
+  w.onmessage = e => {
+    const d = e.data||{};
+    if(d.type==="status"){onStatus&&onStatus(d);return;}
+    if(d.type==="ready"){ready&&ready.res();return;}
+    if(d.type==="error"&&!d.requestId){ready&&ready.rej(new Error(d.text));return;}
+    if(d.requestId&&waiters.has(d.requestId)){
+      const wt=waiters.get(d.requestId);
+      if(d.type==="error"){waiters.delete(d.requestId);wt.rej(new Error(d.text));}
+      else if(["done","embedded","query_embedded"].includes(d.type)){waiters.delete(d.requestId);wt.res(d);}
+    }
+  };
+  return {
+    load(p){return new Promise((res,rej)=>{ready={res,rej};w.postMessage({type:"load",...(p||{})});});},
+    call(msg){const requestId=Math.random().toString(36).slice(2);return new Promise((res,rej)=>{waiters.set(requestId,{res,rej});w.postMessage({...msg,requestId});});},
+    terminate(){w.terminate();}
+  };
+}
+
+let ingesting=false;
+const embed = makeWorker("/static/embed_worker.js", d=>{
+  setStatus(d.text,"busy"); bar(d.progress);
+  if(ingesting && d.text){ const r=$("doc-report"); r.className=""; r.textContent=d.text; }
+});
+let llm=null,llmReady=null,currentModel=null;
+function newLlm(){if(llm)llm.terminate();llm=makeWorker("/static/llm_worker.js",d=>{setStatus(d.text,"busy");bar(d.progress);});llmReady=null;}
+
+// ── Model dropdown ───────────────────────────────────────────────────────────
+async function initModels(){
+  try{
+    const {llm:list}=await(await fetch("/api/models")).json();
+    const sel=$("model"); sel.innerHTML="";
+    (list.length?list:["gemma-4-E2B-it"]).forEach(n=>{const o=document.createElement("option");o.value=n;o.textContent=n;sel.appendChild(o);});
+    currentModel=sel.value;
+    sel.addEventListener("change",()=>{currentModel=sel.value;newLlm();resetLoadBtn();setStatus("Modell: "+currentModel+" — nicht geladen");});
+  }catch{}
+}
+
+// ---- Modell vorab laden -------------------------------------------------
+function resetLoadBtn(){
+  const b=$("loadModelBtn"); b.disabled=false; b.classList.remove("loaded"); b.textContent="Modell laden";
+}
+$("loadModelBtn").addEventListener("click", async ()=>{
+  const b=$("loadModelBtn");
+  if(llmReady){ return; }
+  b.disabled=true;
+  try{
+    await ensureLLM();
+    b.classList.add("loaded"); b.textContent="Modell geladen ✓";
+  }catch(e){
+    b.disabled=false; setStatus("Modell-Fehler: "+e.message);
+  }
+});
+
+// ── Status / refresh ─────────────────────────────────────────────────────────
+let embeddedCount=0;
+async function refresh(){
+  try{
+    const s=await(await fetch("/api/status")).json();
+    embeddedCount=s.embedded;
+    const badge=$("badge");
+    if(s.embedded>0){
+      setStatus(`${s.docs} Dok. · ${s.embedded} Chunks bereit`,"ok");
+      $("mode-hint").textContent=`100 % lokal · ${s.docs} Dokumente · RAG-Modus aktiv`;
+      $("docBtn").classList.add("active");
+      badge.textContent=Math.min(s.docs,99); badge.classList.remove("hidden");
+    } else {
+      setStatus("kein Dokument geladen","");
+      $("mode-hint").textContent="100 % lokal · kein Dokument geladen · Chat-Modus";
+      $("docBtn").classList.remove("active");
+      badge.classList.add("hidden");
+    }
+  }catch{setStatus("Backend offline");}
+  bar(null);
+}
+
+// ── Doc modal: öffnen/schliessen + Liste ────────────────────────────────────
+function openDocModal(){
+  $("doc-overlay").classList.add("open");
+  $("docBtn").classList.add("active"); $("plusBtn").classList.add("active");
+  renderDocs();
+}
+function closeDocModal(){
+  $("doc-overlay").classList.remove("open");
+  $("docBtn").classList.remove("active"); $("plusBtn").classList.remove("active");
+}
+function toggleDocPanel(){
+  $("doc-overlay").classList.contains("open") ? closeDocModal() : openDocModal();
+}
+$("docBtn").addEventListener("click",toggleDocPanel);
+$("plusBtn").addEventListener("click",toggleDocPanel);
+$("dmClose").addEventListener("click",closeDocModal);
+$("doc-overlay").addEventListener("click",e=>{ if(e.target===$("doc-overlay")) closeDocModal(); });
+document.addEventListener("keydown",e=>{ if(e.key==="Escape" && $("doc-overlay").classList.contains("open")) closeDocModal(); });
+
+const DOC_ICON='<svg class="dr-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>';
+const DEL_ICON='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>';
+
+async function renderDocs(){
+  const list=$("doc-list"), empty=$("doc-list-empty"), count=$("dm-count");
+  try{
+    const {documents:docs}=await(await fetch("/api/documents")).json();
+    list.innerHTML="";
+    if(!docs || !docs.length){ empty.style.display="block"; count.textContent=""; return; }
+    empty.style.display="none";
+    count.textContent=`${docs.length} Dok. · ${docs.reduce((s,d)=>s+(d.embedded||0),0)} Chunks`;
+    for(const d of docs){
+      const row=document.createElement("div"); row.className="doc-row";
+      const meta = (d.embedded===d.chunks)
+        ? `${d.chunks} Chunks`
+        : `${d.embedded}/${d.chunks} Chunks`;
+      row.innerHTML=`${DOC_ICON}<span class="dr-name" title="${d.name}">${d.name}</span><span class="dr-meta">${meta}</span>`;
+      const del=document.createElement("button"); del.className="dr-del"; del.title="Dokument löschen";
+      del.innerHTML=DEL_ICON;
+      del.addEventListener("click",async()=>{
+        if(!confirm(`"${d.name}" löschen?`))return;
+        del.disabled=true;
+        await fetch("/api/delete_doc",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:d.name})});
+        await renderDocs(); refresh();
+      });
+      row.appendChild(del); list.appendChild(row);
+    }
+  }catch(e){ empty.style.display="block"; empty.textContent="Liste nicht ladbar: "+e.message; }
+}
+
+// ── Doc actions ──────────────────────────────────────────────────────────────
+function showReport(res,el){
+  if(res.error){el.className="";el.className="err";el.textContent="Fehler: "+res.error;return;}
+  el.className="";
+  el.textContent=(res.report||[]).map(x=>`${x.file} — ${x.status}`).join("   ·   ");
+}
+async function embedAndStore(pending){
+  if(!pending.length){ return 0; }
+  ingesting=true;
+  const r=$("doc-report"); r.className="";
+  r.textContent=`${pending.length} Chunks gefunden — Embedding läuft…`;
+  const{items}=await embed.call({type:"embed",items:pending});
+  for(let i=0;i<items.length;i+=50){
+    r.textContent=`Speichere Vektoren ${Math.min(i+50,items.length)}/${items.length}…`;
+    await fetch("/api/store_vectors",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({items:items.slice(i,i+50)})});
+  }
+  ingesting=false;
+  return items.length;
+}
+
+$("ingestBtn").addEventListener("click",async()=>{
+  const inp=$("files"); if(!inp.files.length)return;
+  $("ingestBtn").disabled=true; $("doc-report").className=""; $("doc-report").textContent="Lese Dateien…"; setStatus("lese Dateien…","busy"); bar(5);
+  try{
+    const fd=new FormData(); for(const f of inp.files)fd.append("files",f);
+    const res=await(await fetch("/api/ingest",{method:"POST",body:fd})).json();
+    if(res.error){$("doc-report").className="err";$("doc-report").textContent="Fehler: "+res.error;}
+    else{ const n=await embedAndStore(res.pending||[]);
+          $("doc-report").className="";$("doc-report").textContent=`Fertig: ${n} Chunks indiziert.`; }
+  }catch(e){$("doc-report").className="err";$("doc-report").textContent="Fehler: "+e.message;}
+  $("ingestBtn").disabled=false; inp.value=""; renderDocs(); refresh();
+});
+
+$("folderBtn").addEventListener("click",async()=>{
+  $("folderBtn").disabled=true; setStatus("data\\ wird gelesen…","busy"); bar(5);
+  try{
+    const res=await(await fetch("/api/ingest_folder",{method:"POST"})).json();
+    if(res.error){$("doc-report").className="err";$("doc-report").textContent="Fehler: "+res.error;}
+    else{
+      const neu=(res.report||[]).filter(x=>x.status.startsWith("OK")).length;
+      const skip=(res.report||[]).filter(x=>x.status.includes("übersprungen")).length;
+      const n=await embedAndStore(res.pending||[]);
+      $("doc-report").className="";
+      $("doc-report").textContent=`Fertig: ${neu} neue Dateien (${n} Chunks), ${skip} übersprungen.`;
+    }
+  }catch(e){$("doc-report").className="err";$("doc-report").textContent="Fehler: "+e.message;}
+  $("folderBtn").disabled=false; renderDocs(); refresh();
+});
+
+$("resetBtn").addEventListener("click",async()=>{
+  if(!confirm("Alle indizierten Dokumente löschen?"))return;
+  await fetch("/api/reset",{method:"POST"}); $("doc-report").textContent=""; renderDocs(); refresh();
+});
+
+$("newChatBtn").addEventListener("click",()=>{
+  const msgs=$("messages"); msgs.innerHTML="";
+  chatHistory.length=0;                   // Kurzzeitgedaechtnis zuruecksetzen
+  if(!$("welcome")){
+    const w=document.createElement("div"); w.id="welcome";
+    const chatWrap=$("chat-wrap"); chatWrap.insertBefore(w,$("messages"));
+    rebuildWelcome(w);
+  }
+});
+
+function rebuildWelcome(el){
+  el.innerHTML=`
+    <div class="wl-icon"><svg viewBox="0 0 24 24"><path d="M12 2.5 L4.5 5.5 V11 c0 4.6 3.1 8 7.5 9.5 c4.4 -1.5 7.5 -4.9 7.5 -9.5 V5.5 Z" fill="currentColor"/><polygon points="12.6 6.5 8 13 11.3 13 10.4 17.5 15.5 11 11.8 11" fill="var(--accent)"/></svg></div>
+    <h2>Wie kann ich helfen?</h2>
+    <p>Stelle eine Frage — oder lade Dokumente für die semantische Suche (RAG-Modus).</p>`;
+}
+function fillQuery(text){const q=$("q");q.value=text;q.focus();q.dispatchEvent(new Event("input"));}
+
+// ── Chat ─────────────────────────────────────────────────────────────────────
+const messages=$("messages");
+function addMsg(text,who,mode){
+  $("welcome")?.remove();
+  const m=document.createElement("div"); m.className="msg "+who+(mode?" "+mode:"");
+  const meta=document.createElement("div"); meta.className="msg-meta";
+  const av=document.createElement("div"); av.className="avatar"+(who==="user"?" user-av":"");
+  if(who==="user"){av.textContent="Du";}else{
+    av.innerHTML='<svg viewBox="0 0 24 24"><path d="M12 2.5 L4.5 5.5 V11 c0 4.6 3.1 8 7.5 9.5 c4.4 -1.5 7.5 -4.9 7.5 -9.5 V5.5 Z" fill="currentColor"/><polygon points="12.6 6.5 8 13 11.3 13 10.4 17.5 15.5 11 11.8 11" fill="var(--accent)"/></svg>';
+  }
+  const name=document.createElement("span"); name.className="msg-name";
+  name.textContent=who==="user"?"Du":mode==="chatmode"?"tiseR · Chat":"tiseR · RAG";
+  if(who==="user"){meta.appendChild(name);meta.appendChild(av);}else{meta.appendChild(av);meta.appendChild(name);}
+  const b=document.createElement("div"); b.className="bubble";
+  if(text===null){m.classList.add("empty");b.innerHTML='<span class="typing"><i></i><i></i><i></i></span>';}
+  else b.textContent=text;
+  m.appendChild(meta); m.appendChild(b); messages.appendChild(m);
+  $("chat-wrap").scrollTop=$("chat-wrap").scrollHeight;
+  return{m,b};
+}
+function addSources(after,hits){
+  if(!hits?.length)return;
+  const d=document.createElement("details");d.className="src";
+  const s=document.createElement("summary");s.textContent=hits.length+" Quellen";d.appendChild(s);
+  for(const h of hits){const c=document.createElement("div");c.className="chip";
+    c.innerHTML=`<b>${h.source} · ${h.score}</b><br>${h.text.slice(0,200).replace(/</g,"&lt;")}…`;d.appendChild(c);}
+  after.querySelector(".bubble").after(d);
+}
+async function ensureLLM(){
+  if(!llmReady){
+    setStatus("LLM lädt ("+currentModel+", einmalig)…","busy");
+    llmReady=llm.load({model_name:currentModel});
+    await llmReady;
+    const b=$("loadModelBtn"); b.disabled=true; b.classList.add("loaded"); b.textContent="Modell geladen ✓";
+    setStatus("Modell bereit · "+currentModel,"ok"); bar(null);   // stale "LLM lädt 0%" überschreiben
+  }
+}
+let chatHistory=[];   // Kurzzeitgedaechtnis: [{role:'user'|'assistant', content}]
+// Token-Obergrenze: Zusammenfassungen/Listen brauchen mehr Platz. Kurze
+// Faktenantworten stoppen ohnehin früher (EOS), die Obergrenze kostet sie nichts.
+function maxTokensFor(q){
+  const s=(q||"").toLowerCase();
+  if(/zusammenfass|fasse|überblick|uberblick|liste|auflist|alle (stärken|schwächen|risiken|chancen|punkte|rollen)|worum geht|was steht/.test(s)) return 1500;
+  return 700;
+}
+async function ask(){
+  const ta=$("q"); const q=ta.value.trim(); if(!q)return;
+  ta.value=""; ta.style.height="auto"; $("askBtn").disabled=true; addMsg(q,"user");
+  const tok=maxTokensFor(q);
+  let answer="";
+  try{
+    if(embeddedCount>0){
+      const{m,b}=addMsg(null,"bot");
+      setStatus("suche…","busy"); bar(20);
+      const{vector}=await embed.call({type:"embed_query",text:q});
+      const{hits}=await(await fetch("/api/search",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({vector,query:q})})).json();
+      if(!hits?.length){
+        m.classList.add("chatmode"); m.querySelector(".msg-name").textContent="tiseR · Chat";
+        await ensureLLM();
+        const{text}=await llm.call({type:"generate",prompt:q,context:[],maxNewTokens:tok,systemPrompt:PROMPT_CHAT,history:chatHistory});
+        m.classList.remove("empty"); b.textContent=text; answer=text;
+      } else {
+        await ensureLLM();
+        const{text}=await llm.call({type:"generate",prompt:q,context:hits.map(h=>({source:h.source,content:h.text})),maxNewTokens:tok,systemPrompt:PROMPT_RAG,history:chatHistory});
+        m.classList.remove("empty"); b.textContent=text; answer=text; addSources(m,hits);
+      }
+    } else {
+      const{m,b}=addMsg(null,"bot","chatmode");
+      setStatus("antworte…","busy"); bar(30);
+      await ensureLLM();
+      const{text}=await llm.call({type:"generate",prompt:q,context:[],maxNewTokens:tok,systemPrompt:PROMPT_CHAT,history:chatHistory});
+      m.classList.remove("empty"); b.textContent=text; answer=text;
+    }
+    // Turn ins Gedaechtnis; auf die letzten 6 Nachrichten (3 Paare) begrenzen.
+    if(answer){
+      chatHistory.push({role:"user",content:q},{role:"assistant",content:answer});
+      if(chatHistory.length>6) chatHistory.splice(0,chatHistory.length-6);
+    }
+  }catch(e){addMsg("Fehler: "+e.message,"bot");}
+  bar(null); refresh(); $("askBtn").disabled=false;
+}
+$("askBtn").addEventListener("click",ask);
+const ta=$("q");
+ta.addEventListener("input",()=>{ta.style.height="auto";ta.style.height=Math.min(ta.scrollHeight,130)+"px";});
+ta.addEventListener("keydown",e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();ask();}});
+
+(async()=>{await initModels();newLlm();try{await embed.load();}catch(e){setStatus("Embedder-Fehler: "+e.message);}refresh();})();
+</script>
+</body>
+</html>

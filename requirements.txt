@@ -1,0 +1,17 @@
+# armachat / tiseR - Abhaengigkeiten (AppLocker-konform, reines Python, KEINE .pyd/.dll)
+Flask==3.0.3
+pypdf==5.9.0          # PDF-Extraktion (ersetzt das blockierte pdfminer.six)
+olefile==0.47        # nur fuer .msg (Outlook = binaeres OLE/CFBF); reines Python
+
+# Embedding + LLM laufen NICHT in Python, sondern im Edge-Browser (Transformers.js).
+# Daher hier KEIN torch/onnxruntime/faiss/sentence-transformers.
+#
+# DOCX/XLSX/PPTX/CSV/TXT/EML brauchen KEINE Zusatzpakete - reine stdlib
+# (zipfile + xml.etree, csv, email).
+#
+# Offline installieren (Rechner mit Internet -> Zielrechner):
+#   pip download -r requirements.txt -d wheels
+#   pip install --no-index --find-links wheels -r requirements.txt
+#
+# olefile ist optional: fehlt es, funktionieren alle anderen Formate weiter;
+# nur .msg meldet dann einen klaren Hinweis statt zu laden.
