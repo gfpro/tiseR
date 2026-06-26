@@ -231,9 +231,10 @@ Ordnernamen: `gemma-4-E2B-it` (klein/schnell), `gemma-4-E4B-it` (grösser/besser
 oder ein LFM2-Modell.
 
 Modelle:
-[Apertus-v1.1-4B-Instruct](https://huggingface.co/onnx-community/Apertus-v1.1-4B-Instruct-ONNX)
-[Gemma 4 E2B](https://huggingface.co/onnx-community/gemma-4-E2B-it-ONNX)
-[LFM2-2.6B](https://huggingface.co/onnx-community/LFM2-2.6B-ONNX)
+
+- [Apertus-v1.1-4B-Instruct](https://huggingface.co/onnx-community/Apertus-v1.1-4B-Instruct-ONNX)
+- [Gemma 4 E2B](https://huggingface.co/onnx-community/gemma-4-E2B-it-ONNX)
+- [LFM2-2.6B](https://huggingface.co/onnx-community/LFM2-2.6B-ONNX)
 
 > **Wichtig:** Lege **kein** Embedding-Modell ohne erkennbares Namensmuster in
 > `models/` ab. Das Backend filtert Embedder am Namen (`e5-`, `minilm`, `embed`,
