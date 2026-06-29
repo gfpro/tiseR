@@ -10,6 +10,14 @@ Optimierungen ggue. v1:
   4. Zusaetzliche Formate DOCX + XLSX, geparst via stdlib zipfile + ElementTree
      (KEINE nativen DLLs -> AppLocker-konform; KEIN python-docx/openpyxl/lxml).
   5. /api/documents (Liste) + /api/delete_doc (Einzelloeschung) fuer die UI.
+  6. Leichtgewichtige Metadaten-Tags pro Chunk (frist/schwellenwert/zustaendigkeit),
+     per Regex beim Indexieren erkannt, SEPARAT gespeichert (nie ins Embedding-Fenster!)
+     und fuer einen weichen, multiplikativen Boost in hybrid_search nutzbar.
+     WICHTIG: Boost ist per Default NEUTRAL (TAG_BOOST = 1.0). Erst scharf schalten,
+     wenn der Eval-Harness Hybrid+Boost messen kann — blind aktivieren waere falsch.
+  7. Markdown (.md/.markdown) als Eingabeformat — inkl. YAML-Frontmatter (OKF-tauglich).
+     KEIN Konverter: andere Formate werden NICHT nach Markdown gewandelt, nur native
+     .md-Dateien direkt gelesen. Frontmatter-Tags fliessen in die Chunk-Tags ein.
 PDF-Extraktion: pypdf (reines Python).
 """
 import io, json, math, re, sqlite3, logging, zipfile
@@ -39,6 +47,11 @@ CHUNK_MIN    = 15       # Mindestlaenge (sonst gehen kurze Folien beim Seiten-Fl
 TOP_K        = 6        # etwas mehr Treffer, da Chunks jetzt kleiner sind
 RRF_K        = 60       # RRF-Konstante (Standardwert)
 PAGE_BREAK   = "\x0c"   # Seiten-/Foliengrenze -> harter Chunk-Schnitt
+# Metadaten-Boost: weicher, MULTIPLIKATIVER Faktor auf Chunks, deren Tags zum
+# Fragetyp passen. 1.0 = AUS (Feature verdrahtet, aber wirkungslos). Erst auf
+# z.B. 1.15 erhoehen, NACHDEM eval_harness.py Hybrid+Boost gegen reines BM25
+# gemessen hat. Vorher waere jede Zahl reines Bauchgefuehl.
+TAG_BOOST    = 1.0
 
 app = Flask(__name__, static_folder=None)
 app.config["MAX_CONTENT_LENGTH"] = 80 * 1024 * 1024
@@ -69,12 +82,18 @@ def init_db():
     conn.row_factory = sqlite3.Row   # FIX: ohne dies sind Zeilen Tupel -> r["id"] crasht bei gefuellter DB
     conn.execute("""CREATE TABLE IF NOT EXISTS chunks(
         id INTEGER PRIMARY KEY, source TEXT NOT NULL, ord INTEGER NOT NULL,
-        text TEXT NOT NULL, vec TEXT)""")
+        text TEXT NOT NULL, vec TEXT, tags TEXT)""")
+    # Migration bestehender DBs (vor dem Tags-Feature angelegt): Spalte nachruesten.
+    try:
+        conn.execute("ALTER TABLE chunks ADD COLUMN tags TEXT")
+    except sqlite3.OperationalError:
+        pass   # Spalte existiert bereits -> nichts zu tun
     conn.commit()
     VECTORS.clear()
-    for r in conn.execute("SELECT id, source, text, vec FROM chunks WHERE vec IS NOT NULL"):
+    for r in conn.execute("SELECT id, source, text, vec, tags FROM chunks WHERE vec IS NOT NULL"):
         VECTORS.append({"id": r["id"], "source": r["source"], "text": r["text"],
-                        "vec": json.loads(r["vec"]), "toks": _tok(r["text"])})
+                        "vec": json.loads(r["vec"]), "toks": _tok(r["text"]),
+                        "tags": json.loads(r["tags"]) if r["tags"] else []})
     conn.close()
     rebuild_bm25()
     log.info("DB bereit. %d Chunks mit Vektor.", len(VECTORS))
@@ -279,27 +298,108 @@ def extract_msg_text(src) -> str:
     finally:
         ole.close()
 
+# --------------------------------------------------------------- Markdown (.md, OKF-tauglich)
+# KEIN Konverter: wir wandeln NICHTS nach Markdown. Wir LESEN nur native .md-Dateien.
+# YAML-Frontmatter wird minimal (ohne PyYAML, reine stdlib) geparst: nur die flachen
+# Felder, die OKF nutzt (title, tags). Reicht fuer OKF-Bundles und Confluence-Exporte.
+_FM_DELIM = re.compile(r'^---\s*$')
+
+def _parse_frontmatter(raw: str):
+    """Trennt YAML-Frontmatter vom Body. Liefert (body, title, tags).
+    Bewusst genuegsam: 'key: value' und 'tags: [a, b]' bzw. 'tags: a, b'.
+    Verschachteltes YAML wird ignoriert (kommt in OKF-Frontmatter praktisch nicht vor)."""
+    lines = raw.split("\n")
+    if not lines or not _FM_DELIM.match(lines[0]):
+        return raw, "", []           # kein Frontmatter -> alles ist Body
+    end = None
+    for i in range(1, len(lines)):
+        if _FM_DELIM.match(lines[i]):
+            end = i; break
+    if end is None:
+        return raw, "", []           # oeffnendes '---' ohne Abschluss -> als Body behandeln
+    title, tags = "", []
+    for ln in lines[1:end]:
+        m = re.match(r'\s*([A-Za-z_][\w-]*)\s*:\s*(.*)$', ln)
+        if not m:
+            continue
+        key, val = m.group(1).lower(), m.group(2).strip()
+        if key == "title":
+            title = val.strip('"\'')
+        elif key == "tags":
+            val = val.strip()
+            if val.startswith("[") and val.endswith("]"):
+                val = val[1:-1]
+            tags = [t.strip().strip('"\'').lower() for t in val.split(",") if t.strip()]
+    body = "\n".join(lines[end + 1:])
+    return body, title, tags
+
+def extract_md_text(src) -> str:
+    """Markdown-Body als Text. Frontmatter-title wird als Markdown-Ueberschrift
+    vorangestellt (echte Struktur -> wird vom Chunker als Praefix erkannt).
+    Frontmatter-tags werden NICHT hier verarbeitet, sondern in extract_text_any
+    (das den Tag-Kanal getrennt vom Text fuehrt)."""
+    body, title, _tags = _parse_frontmatter(_decode(_read_bytes(src)))
+    return (f"# {title}\n{body}") if title else body
+
+def _md_seed_tags(src) -> list:
+    """Liefert NUR die Frontmatter-tags (separater Kanal, geht nie ins Embedding)."""
+    _body, _title, tags = _parse_frontmatter(_decode(_read_bytes(src)))
+    return tags
+
 # Dispatcher nach Dateiendung. PdfReader/ZipFile/olefile akzeptieren Pfad ODER BytesIO.
 _EXT_HANDLERS = {
     ".pdf": extract_pdf_text,   ".docx": extract_docx_text, ".xlsx": extract_xlsx_text,
     ".pptx": extract_pptx_text, ".csv": extract_csv_text,   ".txt": extract_txt_text,
     ".eml": extract_eml_text,   ".msg": extract_msg_text,
+    ".md": extract_md_text,     ".markdown": extract_md_text,
 }
 SUPPORTED_EXT = tuple(_EXT_HANDLERS.keys())
 
-def extract_text_any(name: str, src) -> str:
+def extract_text_any(name: str, src):
+    """Liefert (text, seed_tags). seed_tags stammen NUR aus .md-Frontmatter und
+    sind ein vom Text getrennter Metadaten-Kanal (gelangen nie ins Embedding)."""
     ext = Path(name).suffix.lower()
     handler = _EXT_HANDLERS.get(ext)
     if not handler:
         raise ValueError(f"Format '{ext or '?'}' nicht unterstuetzt "
-                         f"(PDF, DOCX, XLSX, PPTX, CSV, TXT, EML, MSG)")
-    return handler(src)
+                         f"(PDF, DOCX, XLSX, PPTX, CSV, TXT, EML, MSG, MD)")
+    # .md kann BytesIO/Pfad sein; seed_tags brauchen einen zweiten Lesedurchgang.
+    # Bei BytesIO daher vor dem Handler-Aufruf die Tags ziehen und zuruecksetzen.
+    seed_tags = []
+    if ext in (".md", ".markdown"):
+        if hasattr(src, "read"):
+            seed_tags = _md_seed_tags(src)
+            src.seek(0)                      # Stream fuer den Handler zuruecksetzen
+        else:
+            seed_tags = _md_seed_tags(src)
+    return handler(src), seed_tags
+
+# --------------------------------------------------------------- Metadaten-Tagger (heuristisch)
+# Pure Python, AppLocker-safe. Bewusst konservativ. Tags landen SEPARAT (nie im Text).
+_RX_FRIST    = re.compile(r'\b(frist(?:en)?|innerhalb|binnen|spätestens|spaetestens|'
+                          r'werktag\w*|arbeitstag\w*|stunden?|tagen?|wochen?|monaten?)\b', re.I)
+_RX_ZUST     = re.compile(r'\b(zuständig\w*|zustaendig\w*|verantwortlich\w*|obliegt|'
+                          r'verantwortliche stelle|federführ\w*|federfuehr\w*)\b', re.I)
+# Schwellenwert ist der UNZUVERLAESSIGSTE Tagger: nur Betraege/Vergleiche, KEINE
+# nackten Zahlen (sonst feuert jede Dok-ID/Jahreszahl). 20'000 / CHF 5000 / ≥ 50 / > 1320
+_RX_SCHWELLE = re.compile(r"(chf\s*\d|franken|schwellenwert\w*|\d['’]\d{3}|"
+                          r"[≥≤<>]\s*\d|mindestens|höchstens|hoechstens)", re.I)
+
+def _tag_chunk(text: str):
+    """Erkennt Fragetyp-/Inhaltstyp-Tags. Reihenfolge stabil, fuer reproduzierbare Tests."""
+    tags = []
+    if _RX_FRIST.search(text):    tags.append("frist")
+    if _RX_SCHWELLE.search(text): tags.append("schwellenwert")
+    if _RX_ZUST.search(text):     tags.append("zustaendigkeit")
+    return tags
 
 # --------------------------------------------------------------- Strukturbewusstes Chunking
 _TOC  = re.compile(r'\.{5,}\s*\d+\s*$')
 # Abschnittsnummern wie "2.1.3" — Komponenten max. 2-stellig, schliesst Daten
 # (z. B. "12.05.2026") und 4-stellige Jahre aus.
 _HEAD = re.compile(r'^\s*(\d{1,2}(?:\.\d{1,2}){0,3})\s+([A-ZÄÖÜ].{2,80})$')
+# Markdown-ATX-Ueberschrift ("## Titel"); macht .md-Eingaben erststklassig.
+_MD_HEAD = re.compile(r'^(#{1,6})\s+(.+?)\s*#*$')
 _HDR  = re.compile(r'^(MS ID/Ver|Dok-ID/Vers)\s')
 # Wiederkehrende Folien-/Seitenfusszeilen (Datum, Copyright+Folie, reine Foliennr.)
 _MONTHS = "Januar|Februar|März|April|Mai|Juni|Juli|August|September|Oktober|November|Dezember"
@@ -324,9 +424,12 @@ def _clean_lines(text: str):
         out.append(ln)
     return out
 
-def make_chunks(text: str, source: str):
+def make_chunks(text: str, source: str, seed_tags=()):
+    """seed_tags: optionale Tags aus z.B. .md-Frontmatter, die JEDEM Chunk dieses
+    Dokuments mitgegeben werden (zusaetzlich zu den heuristisch erkannten)."""
     lines = _clean_lines(text)
     chunks = []; cur = []; head = ""; L = 0; ordn = 0
+    seed = list(dict.fromkeys(t.lower() for t in seed_tags))   # dedupe, stabil
     def flush():
         nonlocal cur, L, ordn
         if cur:
@@ -335,7 +438,10 @@ def make_chunks(text: str, source: str):
                 # Nur die Ueberschrift als Praefix (echte Struktur); KEIN Dateiname
                 # mehr, der nur das Embedding-Fenster mit Rauschen fuellt.
                 prefix = f"{head}: " if head else ""
-                chunks.append({"source": source, "ord": ordn, "text": prefix + body})
+                full = prefix + body
+                # Tags aus Inhalt + Frontmatter-Seeds; Reihenfolge stabil, dedupe.
+                tags = list(dict.fromkeys(_tag_chunk(full) + seed))
+                chunks.append({"source": source, "ord": ordn, "text": full, "tags": tags})
                 ordn += 1
         cur = []; L = 0
     for ln in lines:
@@ -345,6 +451,10 @@ def make_chunks(text: str, source: str):
         if m and re.search(r'[a-zäöü]', m.group(2)):  # echte Ueberschrift, kein Code-Fragment (R8 R2…)
             flush(); head = f"{m.group(1)} {m.group(2)}".strip()
             cur = [ln]; L = len(ln); continue
+        mh = _MD_HEAD.match(ln)                       # Markdown-Ueberschrift ("## Titel")
+        if mh:
+            flush(); head = mh.group(2).strip()
+            cur = [head]; L = len(head); continue     # '#'-Zeichen nicht in den Text uebernehmen
         if L + len(ln) > CHUNK_HARD: flush()
         cur.append(ln); L += len(ln) + 1
         if L >= CHUNK_TARGET and ln.endswith(('.', ';', ':')): flush()
@@ -354,8 +464,9 @@ def make_chunks(text: str, source: str):
 def _store_chunks(conn, chunks):
     pending = []; cur = conn.cursor()
     for c in chunks:
-        cur.execute("INSERT INTO chunks(source, ord, text, vec) VALUES(?,?,?,NULL)",
-                    (c["source"], c["ord"], c["text"]))
+        cur.execute("INSERT INTO chunks(source, ord, text, vec, tags) VALUES(?,?,?,NULL,?)",
+                    (c["source"], c["ord"], c["text"], json.dumps(c.get("tags") or [])))
+        # Embedder bekommt NUR id+text — Tags bleiben absichtlich aussen vor.
         pending.append({"id": cur.lastrowid, "text": c["text"]})
     return pending
 
@@ -391,6 +502,71 @@ def rebuild_bm25():
     global BM25
     BM25 = PureBM25([it["toks"] for it in VECTORS]) if VECTORS else None
 
+# --------------------------------------------------------------- Strukturierte Suchsyntax
+# Schält Operatoren aus dem Fragetext: tags:frist | source:xyz | filename:*.pdf |
+# "exakte phrase" | /regex/ | NOT wort | -wort. Der Rest bleibt Freitext und geht
+# unveraendert ins Hybrid-Retrieval. Reiner Freitext (kein Operator) loest KEINEN
+# Hard-Filter aus -> normale Fragen verhalten sich exakt wie bisher.
+import fnmatch as _fnmatch
+
+_RX_Q_FIELD  = re.compile(r'(\w+):("(?:[^"]*)"|\S+)')
+_RX_Q_PHRASE = re.compile(r'"([^"]+)"')
+_RX_Q_REGEX  = re.compile(r'/((?:[^/\\]|\\.)+)/')
+_RX_Q_NOT    = re.compile(r'(?:^|\s)(?:NOT\s+|-)([^\s"]+)')
+
+def parse_query(q):
+    q = q or ""
+    out = {"tags": [], "sources": [], "filenames": [], "phrases": [],
+           "regexes": [], "excludes": [], "free": ""}
+    def _grab_regex(m):
+        out["regexes"].append(m.group(1)); return " "
+    q = _RX_Q_REGEX.sub(_grab_regex, q)
+    def _grab_field(m):
+        key = m.group(1).lower(); val = m.group(2)
+        if val.startswith('"') and val.endswith('"'): val = val[1:-1]
+        val_l = val.lower()
+        if key in ("tag", "tags"):              out["tags"].append(val_l)
+        elif key in ("source", "src", "dok", "doc"): out["sources"].append(val_l)
+        elif key in ("filename", "file", "datei"):   out["filenames"].append(val_l)
+        else: return m.group(0)   # unbekanntes feld:wert -> als Freitext behalten
+        return " "
+    q = _RX_Q_FIELD.sub(_grab_field, q)
+    def _grab_not(m):
+        out["excludes"].append(m.group(1).lower()); return " "
+    q = _RX_Q_NOT.sub(_grab_not, q)
+    def _grab_phrase(m):
+        out["phrases"].append(m.group(1)); return " "
+    q = _RX_Q_PHRASE.sub(_grab_phrase, q)
+    out["free"] = re.sub(r'\s+', ' ', q).strip()
+    return out
+
+def candidate_indices(parsed):
+    """Indizes in VECTORS, die ALLE Hard-Constraints erfuellen. None = kein
+    Constraint gesetzt (Aufrufer nutzt dann alle Chunks)."""
+    if not any([parsed["tags"], parsed["sources"], parsed["filenames"],
+                parsed["phrases"], parsed["regexes"], parsed["excludes"]]):
+        return None
+    compiled_rx = []
+    for rx in parsed["regexes"]:
+        try: compiled_rx.append(re.compile(rx, re.IGNORECASE))
+        except re.error: pass
+    keep = set()
+    for idx, it in enumerate(VECTORS):
+        text   = it.get("text") or ""
+        text_l = text.lower()
+        src_l  = (it.get("source") or "").lower()
+        itags  = set(it.get("tags") or [])
+        if parsed["tags"] and not all(t in itags for t in parsed["tags"]): continue
+        if parsed["sources"] and not any(s in src_l for s in parsed["sources"]): continue
+        if parsed["filenames"] and not any(_fnmatch.fnmatch(src_l, f) for f in parsed["filenames"]): continue
+        if parsed["phrases"] and not all(p.lower() in text_l for p in parsed["phrases"]): continue
+        if compiled_rx and not all(rx.search(text) for rx in compiled_rx): continue
+        if parsed["excludes"]:
+            toks = set(_tok(text))
+            if any(x in toks or x in src_l for x in parsed["excludes"]): continue
+        keep.add(idx)
+    return keep
+
 # --------------------------------------------------------------- Suche
 def l2_normalize(vec):
     n = math.sqrt(sum(x * x for x in vec)) or 1.0
@@ -402,22 +578,50 @@ def _cosine_ranking(query_vec):
     scored.sort(key=lambda x: x[0], reverse=True)
     return [idx for _, idx in scored]
 
-def _bm25_ranking(query_text):
+def _bm25_ranking(query_text, allowed=None):
     if not BM25 or not query_text: return []
     sc = BM25.scores(_tok(query_text))
-    return sorted(range(len(sc)), key=lambda i: sc[i], reverse=True)
+    order = sorted(range(len(sc)), key=lambda i: sc[i], reverse=True)
+    if allowed is not None:
+        order = [i for i in order if i in allowed]
+    return order
 
 def hybrid_search(query_vec, query_text, k=TOP_K):
-    """Reciprocal Rank Fusion ueber Cosine- und BM25-Ranking."""
+    """Reciprocal Rank Fusion ueber Cosine- und BM25-Ranking, plus optionalem,
+    weichem Tag-Boost. Strukturierte Operatoren (tags:, source:, filename:,
+    "phrase", /regex/, NOT/-) werden als HARTER Vorfilter angewandt; der Rest
+    des Fragetextes ('free') treibt das semantische + lexikalische Ranking."""
     if not VECTORS: return []
+    parsed  = parse_query(query_text or "")
+    allowed = candidate_indices(parsed)        # None = keine Einschraenkung
+    free    = parsed["free"] or (query_text or "")  # ganz ohne Freitext: Originalfrage nutzen
+
     rrf = {}
-    if query_vec:
+    # Vektor nur nutzen, wenn echter Freitext vorhanden ist. Bei reinen
+    # Operator-Abfragen ('tags:frist') waere der Query-Vektor aus Syntax gebildet
+    # und semantisch wertlos -> dann allein ueber Hard-Filter + BM25 gehen.
+    use_vec = bool(query_vec) and bool(parsed["free"])
+    if use_vec:
         for rank, idx in enumerate(_cosine_ranking(query_vec)):
+            if allowed is not None and idx not in allowed: continue
             rrf[idx] = rrf.get(idx, 0.0) + 1.0 / (RRF_K + rank)
-    for rank, idx in enumerate(_bm25_ranking(query_text)):
+    for rank, idx in enumerate(_bm25_ranking(free, allowed)):
         rrf[idx] = rrf.get(idx, 0.0) + 1.0 / (RRF_K + rank)
-    if not rrf:  # kein Vektor, kein Text -> nichts
+
+    # Sonderfall: NUR Hard-Filter, kein Freitext und kein Vektor-Treffer
+    # (z.B. reine "tags:frist"-Abfrage) -> gefilterte Chunks unranked zurueckgeben.
+    if not rrf and allowed:
+        for idx in list(allowed)[:k]:
+            rrf[idx] = 1.0
+    if not rrf:
         return []
+
+    if TAG_BOOST != 1.0:
+        qtags = set(_tag_chunk(free))
+        if qtags:
+            for idx in rrf:
+                if qtags & set(VECTORS[idx].get("tags") or []):
+                    rrf[idx] *= TAG_BOOST
     top = sorted(rrf.items(), key=lambda x: x[1], reverse=True)[:k]
     return [(score, VECTORS[idx]) for idx, score in top]
 
@@ -492,11 +696,11 @@ def delete_doc():
     return jsonify({"ok": True, "deleted": name})
 
 def _ingest_one(conn, name, src, report, pending):
-    try: text = extract_text_any(name, src)
+    try: text, seed_tags = extract_text_any(name, src)
     except Exception as e: report.append({"file": name, "status": f"Lesefehler: {e}"}); return
     if not text or not text.strip():
         report.append({"file": name, "status": "LEER (kein Textlayer?)"}); return
-    chunks = make_chunks(text, name)
+    chunks = make_chunks(text, name, seed_tags)
     pending.extend(_store_chunks(conn, chunks))
     report.append({"file": name, "status": f"OK, {len(chunks)} Chunks"})
 
@@ -548,10 +752,11 @@ def store_vectors():
         if cid is None or not vec: continue
         nv = l2_normalize(vec)
         conn.execute("UPDATE chunks SET vec=? WHERE id=?", (json.dumps(nv), cid))
-        row = conn.execute("SELECT source, text FROM chunks WHERE id=?", (cid,)).fetchone()
+        row = conn.execute("SELECT source, text, tags FROM chunks WHERE id=?", (cid,)).fetchone()
         if row:
             VECTORS.append({"id": cid, "source": row["source"], "text": row["text"],
-                            "vec": nv, "toks": _tok(row["text"])})
+                            "vec": nv, "toks": _tok(row["text"]),
+                            "tags": json.loads(row["tags"]) if row["tags"] else []})
             n += 1
     conn.commit()
     rebuild_bm25()                # BM25-Index nach Vektor-Update neu aufbauen

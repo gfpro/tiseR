@@ -229,6 +229,20 @@
   #mode-hint{max-width:720px;margin:6px auto 0;font-family:var(--mono);font-size:10px;
     text-transform:uppercase;letter-spacing:.07em;color:var(--muted2);text-align:center;}
 
+  /* Suchsyntax-Hinweis (ausklappbar) */
+  #syntax-hint{max-width:720px;margin:4px auto 0;text-align:center;}
+  #syntax-hint summary{font-family:var(--mono);font-size:10px;text-transform:uppercase;
+    letter-spacing:.07em;color:var(--muted2);cursor:pointer;list-style:none;
+    display:inline-block;padding:2px 8px;border-radius:6px;transition:color .12s,background .12s;}
+  #syntax-hint summary::-webkit-details-marker{display:none;}
+  #syntax-hint summary:hover{color:var(--accent);background:var(--surface);}
+  #syntax-hint[open] summary{color:var(--accent);}
+  .sx-grid{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;max-width:560px;
+    margin:8px auto 2px;padding:10px 14px;background:var(--surface);
+    border:1px solid var(--border);border-radius:var(--r-sm);text-align:left;}
+  .sx-grid code{font-family:var(--mono);font-size:11px;color:var(--accent-dark);white-space:nowrap;}
+  .sx-grid span{font-size:11px;color:var(--muted);line-height:1.4;}
+
   /* Progress bar */
   #bar{position:fixed;top:0;left:0;height:2px;background:var(--accent);width:0;z-index:100;transition:width .2s;opacity:0;}
   #bar.on{opacity:1;}
@@ -330,6 +344,18 @@
       </button>
     </div>
     <div id="mode-hint">100 % lokal · kein Dokument geladen · Chat-Modus</div>
+    <details id="syntax-hint">
+      <summary>Suchsyntax</summary>
+      <div class="sx-grid">
+        <code>tags:frist</code><span>nur Chunks mit Tag (frist · schwellenwert · zustaendigkeit)</span>
+        <code>source:BöB</code><span>nur Dokumente, deren Name den Begriff enthält</span>
+        <code>filename:*.pdf</code><span>Dateiname nach Muster (Glob)</span>
+        <code>"genaue Phrase"</code><span>muss wörtlich im Text vorkommen</span>
+        <code>/CHF \d+/</code><span>regulärer Ausdruck im Text</span>
+        <code>-Intranet</code><span>Wort ausschliessen (auch: NOT Intranet)</span>
+        <code>tags:schwellenwert BöB</code><span>frei kombinierbar mit normaler Frage</span>
+      </div>
+    </details>
   </div>
 </div>
 
@@ -585,7 +611,7 @@ let chatHistory=[];   // Kurzzeitgedaechtnis: [{role:'user'|'assistant', content
 // Faktenantworten stoppen ohnehin früher (EOS), die Obergrenze kostet sie nichts.
 function maxTokensFor(q){
   const s=(q||"").toLowerCase();
-  if(/zusammenfass|fasse|überblick|uberblick|liste|auflist|alle (stärken|schwächen|risiken|chancen|punkte|rollen)|worum geht|was steht/.test(s)) return 1500;
+  if(/zusammenfass|\bfasse\b|überblick|uberblick|\bliste\b|\bauflist\w*\b|alle (stärken|schwächen|risiken|chancen|punkte|rollen)|worum geht|was steht/.test(s)) return 1500;
   return 700;
 }
 async function ask(){
