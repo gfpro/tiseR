@@ -230,11 +230,15 @@ Stelle mindestens die zur Hardware passende Variante bereit. Beispiele für LLM-
 Ordnernamen: `gemma-4-E2B-it` (klein/schnell), `gemma-4-E4B-it` (grösser/besser),
 oder ein LFM2-Modell.
 
-Modelle:
+Modelle (bevorzugt LFM2-Bund):
 
 - [Apertus-v1.1-4B-Instruct](https://huggingface.co/onnx-community/Apertus-v1.1-4B-Instruct-ONNX)
 - [Gemma 4 E2B](https://huggingface.co/onnx-community/gemma-4-E2B-it-ONNX)
+- [Gemma 4 E4B](https://huggingface.co/onnx-community/gemma-4-E4B-it-ONNX)
 - [LFM2-2.6B](https://huggingface.co/onnx-community/LFM2-2.6B-ONNX)
+- [LFM2-Bund (trainiertes Modell)](https://huggingface.co/gfp78/lfm2-bund-onnx-v2)
+- [LFM2-MoE-8B-A1B](https://huggingface.co/LiquidAI/LFM2-8B-A1B-ONNX)
+  
 
 > **Wichtig:** Lege **kein** Embedding-Modell ohne erkennbares Namensmuster in
 > `models/` ab. Das Backend filtert Embedder am Namen (`e5-`, `minilm`, `embed`,
