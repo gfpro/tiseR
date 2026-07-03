@@ -84,6 +84,7 @@ enthält `requirements.txt` bewusst kein `torch`/`onnxruntime`/`faiss`.
   mehrere GB).
 - Die Modelldateien und das Transformers.js-Bundle **sind nicht Teil dieses
   Repos** und müssen separat bereitgestellt werden (siehe unten).
+- BIT-Client der neueren Generation (Intel Core Ultra 5 225U mit iGPU).
 
 ---
 
@@ -114,6 +115,8 @@ tiseR/
 > `static/transformersjs-420/`, `models/` und `data/` werden **nicht** mit
 > ausgeliefert. Sie stehen in `.gitignore` (siehe unten) und müssen lokal befüllt
 > werden.
+
+- [Transformers.js v4.2](https://github.com/huggingface/transformers.js/releases)
 
 ---
 
