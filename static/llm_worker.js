@@ -1,19 +1,23 @@
 /**
- * armachat — LLM-Worker  (gemma-4-E4B-it, q4f16 WebGPU / uint8 WASM-Fallback)
- * Abgeleitet aus LoKI loki_worker.js (bewährte Lade-Sequenz + Output-Parsing).
- * Vereinfacht: EIN strikter RAG-Prompt, KEINE Fragetyp-Klassifikation,
- * KEINE deterministische Faktenschicht. Greedy decoding für Faktentreue.
+ * tiseR — LLM-Worker   [Version 20260702v01]
+ * Modellunabhaengig: dtype wird aus den vorhandenen model_<dtype>.onnx-Dateien
+ * ERKANNT (HEAD-Probe), nicht am Modellnamen hartcodiert. Neue Modelle unter
+ * \models\ laufen ohne Codeaenderung.
+ * Abgeleitet aus LoKI loki_worker.js. Greedy decoding fuer Faktentreue.
  *
- * Ablegen unter:  C:\armachat\static\llm_worker.js
+ * Ablegen unter:  C:\tiseR\static\llm_worker.js
  */
-let MODEL_NAME  = 'gemma-4-E4B-it';
-let MODEL_DTYPE = 'q4f16';     // WebGPU
-let WASM_DTYPE  = 'uint8';     // CPU-Fallback
+let MODEL_NAME  = '';          // kommt IMMER per 'load' aus index.html (Dropdown)
 const ORIGIN    = self.location.origin;
 const TJS_URL   = ORIGIN + '/static/transformersjs-420/transformers.min.js';
 const WASM_BASE = ORIGIN + '/static/transformersjs-420/';
 let MODEL_BASE  = ORIGIN + '/models/' + MODEL_NAME;
-let PROMPT_BUDGET = 3000;      // Gesamt-Zeichenbudget für den Kontext (E4B)
+let PROMPT_BUDGET = 3000;      // Gesamt-Zeichenbudget fuer den Kontext (modellunabhaengig)
+
+// dtype-Kandidaten in Praeferenzreihenfolge. Erstes im onnx\-Ordner vorhandenes
+// File gewinnt -> der Dateiname entscheidet (q4 vs q4f16 vs …), nicht der Name.
+const DTYPE_WEBGPU = ['q4f16', 'fp16', 'q4', 'q8', 'int8', 'uint8'];
+const DTYPE_WASM   = ['q4', 'uint8', 'q8', 'int8', 'q4f16'];
 
 let generator = null, loading = false, generating = false;
 const queue = [];
@@ -43,8 +47,6 @@ self.onmessage = async (e) => {
   const d = e.data || {};
   if (d.type === 'load') {
     if (d.model_name) { MODEL_NAME = d.model_name; MODEL_BASE = ORIGIN + '/models/' + MODEL_NAME; }
-    if (MODEL_NAME === 'gemma-4-E4B-it') PROMPT_BUDGET = 3000;
-    else if (MODEL_NAME === 'gemma-4-E2B-it') PROMPT_BUDGET = 2400;
     await loadModel();
   } else if (d.type === 'generate') {
     if (!generator) await loadModel();
@@ -61,6 +63,21 @@ async function drain() {
   generating = false;
 }
 
+let TextStreamer = null;   // wird beim Laden aus transformers.js geholt
+
+// Prueft per HEAD, welche model_<dtype>.onnx im onnx\-Ordner liegt. Erster
+// Treffer aus der Praeferenzliste gewinnt, sonst null. Rein dateigetrieben.
+async function detectDtype(device) {
+  const list = (device === 'webgpu') ? DTYPE_WEBGPU : DTYPE_WASM;
+  for (const dt of list) {
+    try {
+      const r = await _origFetch(MODEL_BASE + '/onnx/model_' + dt + '.onnx', { method: 'HEAD' });
+      if (r && r.ok) return dt;
+    } catch (_) { /* naechsten Kandidaten probieren */ }
+  }
+  return null;
+}
+
 async function loadModel() {
   if (generator || loading) return;
   loading = true;
@@ -69,6 +86,7 @@ async function loadModel() {
     const tjs = await import(TJS_URL);
     const pipeline = tjs.pipeline || (tjs.default && tjs.default.pipeline);
     const env      = tjs.env      || (tjs.default && tjs.default.env);
+    TextStreamer   = tjs.TextStreamer || (tjs.default && tjs.default.TextStreamer) || null;
     if (!pipeline || !env) throw new Error('pipeline/env nicht gefunden');
 
     env.allowLocalModels = true;
@@ -81,13 +99,17 @@ async function loadModel() {
       env.backends.onnx.wasm.proxy = false;
     }
 
-    // WebGPU versuchen, sonst CPU/uint8
-    let device = 'wasm', dtype = WASM_DTYPE;
+    // WebGPU verfuegbar?
+    let device = 'wasm';
     if (self.navigator && self.navigator.gpu) {
-      try { if (await self.navigator.gpu.requestAdapter()) { device = 'webgpu'; dtype = MODEL_DTYPE; } }
-      catch (_) {}
+      try { if (await self.navigator.gpu.requestAdapter()) device = 'webgpu'; } catch (_) {}
     }
-    post('status', 'LLM lädt (' + device.toUpperCase() + ')…', 5);
+    // dtype aus den TATSAECHLICH vorhandenen Dateien ableiten.
+    let dtype = await detectDtype(device);
+    if (!dtype) throw new Error(
+      'Keine model_*.onnx in /models/' + MODEL_NAME + '/onnx/ gefunden (gesucht: ' +
+      (device === 'webgpu' ? DTYPE_WEBGPU : DTYPE_WASM).join(', ') + ').');
+    post('status', 'LLM lädt (' + device.toUpperCase() + ', ' + dtype + ')…', 5);
 
     try {
       generator = await pipeline('text-generation', MODEL_NAME, {
@@ -96,9 +118,11 @@ async function loadModel() {
       });
     } catch (err) {
       if (device === 'webgpu') {
-        post('status', 'GPU n/a — lade auf CPU (uint8)…', 5);
+        const wdt = await detectDtype('wasm');
+        post('status', 'GPU n/a — lade auf CPU (' + (wdt || '?') + ')…', 5);
+        if (!wdt) throw err;
         generator = await pipeline('text-generation', MODEL_NAME, {
-          dtype: WASM_DTYPE, device: 'wasm',
+          dtype: wdt, device: 'wasm',
           progress_callback: (p) => post('status', 'CPU-Laden ' + (p.progress ? Math.round(p.progress) : 0) + '%…', p.progress || 0)
         });
       } else throw err;
@@ -119,9 +143,11 @@ async function generate(job) {
   try {
     self.postMessage({ type: 'generating', requestId });
 
-    // Kontext proportional auf das Budget kürzen (LoKI A2)
+    // Kontext proportional auf das Budget kürzen (LoKI A2).
+    // 3 statt 5 Chunks: kürzeres Prefill -> niedrigeres TTFT, kleinerer KV-Cache
+    // pro Decode-Schritt. Top-3 aus e5-large-Retrieval reichen praktisch immer.
     let ctxText = '';
-    const ctx = (job.context || []).slice(0, 5);
+    const ctx = (job.context || []).slice(0, 3);
     if (ctx.length) {
       const totalRaw = ctx.reduce((s, c) => s + (c.content || '').length, 0);
       const perChunk = totalRaw <= PROMPT_BUDGET ? totalRaw : Math.max(200, Math.floor(PROMPT_BUDGET / ctx.length));
@@ -146,11 +172,33 @@ async function generate(job) {
       : { role: 'user', content: job.prompt };
     const messages = [{ role: 'system', content: sysPrompt }, ...histMsgs, currentUser];
 
-    const timeoutMs = Math.max(90000, tokenLimit * 650 + 20000);
-    const result = await withTimeout(generator(messages, {
+    // Token-Streaming: jedes dekodierte Stück sofort an die UI posten, statt auf
+    // die komplette Antwort zu warten. Reale Zeit bleibt gleich, aber das erste
+    // Wort erscheint nach ~1 s statt nach Minuten — das ist der grösste
+    // wahrgenommene Latenzgewinn. Faellt TextStreamer aus (alte tjs-Version),
+    // laeuft der Pfad ohne Streamer weiter (kein Bruch).
+    let streamer = null;
+    if (TextStreamer && generator.tokenizer) {
+      try {
+        streamer = new TextStreamer(generator.tokenizer, {
+          skip_prompt: true,
+          skip_special_tokens: true,
+          callback_function: (txt) => {
+            if (txt) self.postMessage({ type: 'token', text: txt, requestId });
+          }
+        });
+      } catch (_) { streamer = null; }
+    }
+
+    // Timeout: bei Streaming reicht ein knapperes Budget pro Token (220 ms),
+    // da haengende Generierung ohnehin am ausbleibenden Token-Strom sichtbar wird.
+    const timeoutMs = Math.max(60000, tokenLimit * 220 + 15000);
+    const genOpts = {
       max_new_tokens: tokenLimit, do_sample: false,      // greedy = faktentreuer
       repetition_penalty: 1.0,                            // 1.0 = keine Ziffern werden verschluckt (9001 bleibt 9001)
-    }), timeoutMs);
+    };
+    if (streamer) genOpts.streamer = streamer;
+    const result = await withTimeout(generator(messages, genOpts), timeoutMs);
 
     // Antwort extrahieren (Chat-Template -> letzter assistant-Turn)
     let output = result[0] && result[0].generated_text, answer = '';

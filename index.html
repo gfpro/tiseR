@@ -1,4 +1,5 @@
 <!doctype html>
+<!-- tiseR — index.html — 20260702v01 -->
 <html lang="de">
 <head>
 <meta charset="utf-8">
@@ -361,7 +362,7 @@
 
 <script type="module">
 // ── Prompts ──────────────────────────────────────────────────────────────────
-const PROMPT_RAG  = "Du bist ein präziser RAG-Assistent. Antworte auf Deutsch, nur auf Basis der bereitgestellten Dokumente. Du darfst Informationen aus mehreren Stellen kombinieren und zusammenfassen. Enthalten die Dokumente keine Grundlage für die Antwort, sage das offen (z. B. 'Dazu enthalten die Dokumente keine Angabe'). Erfinde keine Fakten.";
+const PROMPT_RAG  = "Du bist ein präziser RAG-Assistent. Antworte auf Deutsch, nur auf Basis der bereitgestellten Dokumente. Antworte so knapp wie möglich — bei Faktenfragen genügen ein bis drei Sätze, keine Einleitung, keine Wiederholung der Frage. Du darfst Informationen aus mehreren Stellen kombinieren. Enthalten die Dokumente keine Grundlage für die Antwort, sage das offen (z. B. 'Dazu enthalten die Dokumente keine Angabe'). Erfinde keine Fakten.";
 const PROMPT_CHAT = "Du bist ein klarer, präziser Berater. Antworte auf Deutsch. Formuliere direkt, ohne Füllwörter. Wenn du etwas nicht weisst, sage es offen.";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -380,13 +381,14 @@ function makeWorker(url, onStatus){
     if(d.type==="error"&&!d.requestId){ready&&ready.rej(new Error(d.text));return;}
     if(d.requestId&&waiters.has(d.requestId)){
       const wt=waiters.get(d.requestId);
+      if(d.type==="token"){ wt.onToken&&wt.onToken(d.text); return; }   // Stream-Delta
       if(d.type==="error"){waiters.delete(d.requestId);wt.rej(new Error(d.text));}
       else if(["done","embedded","query_embedded"].includes(d.type)){waiters.delete(d.requestId);wt.res(d);}
     }
   };
   return {
     load(p){return new Promise((res,rej)=>{ready={res,rej};w.postMessage({type:"load",...(p||{})});});},
-    call(msg){const requestId=Math.random().toString(36).slice(2);return new Promise((res,rej)=>{waiters.set(requestId,{res,rej});w.postMessage({...msg,requestId});});},
+    call(msg,onToken){const requestId=Math.random().toString(36).slice(2);return new Promise((res,rej)=>{waiters.set(requestId,{res,rej,onToken});w.postMessage({...msg,requestId});});},
     terminate(){w.terminate();}
   };
 }
@@ -607,12 +609,27 @@ async function ensureLLM(){
   }
 }
 let chatHistory=[];   // Kurzzeitgedaechtnis: [{role:'user'|'assistant', content}]
-// Token-Obergrenze: Zusammenfassungen/Listen brauchen mehr Platz. Kurze
-// Faktenantworten stoppen ohnehin früher (EOS), die Obergrenze kostet sie nichts.
+// Token-Obergrenze: Zusammenfassungen/Listen brauchen mehr Platz. Faktenfragen
+// (Frist, Schwellenwert, Zuständigkeit) sind nach wenigen Sätzen fertig — ein
+// niedriges Cap halbiert die Decode-Zeit der häufigsten Fragen. Greedy stoppt
+// bei kurzen Antworten ohnehin per EOS, lange Antworten nutzen das volle Budget.
 function maxTokensFor(q){
   const s=(q||"").toLowerCase();
-  if(/zusammenfass|\bfasse\b|überblick|uberblick|\bliste\b|\bauflist\w*\b|alle (stärken|schwächen|risiken|chancen|punkte|rollen)|worum geht|was steht/.test(s)) return 1500;
-  return 700;
+  if(/zusammenfass|\bfasse\b|überblick|uberblick|\bliste\b|\bauflist\w*\b|alle (stärken|schwächen|risiken|chancen|punkte|rollen)|worum geht|was steht/.test(s)) return 900;
+  return 250;
+}
+// Stream-Renderer: bei jedem Token wächst der Text in der Bubble. Beim Abschluss
+// (done.text) ersetzt der bereinigte Endtext den gestreamten Rohtext in einem
+// Zug — so flackern Markdown-/Special-Token-Reste nicht nach.
+function makeStreamSink(bubble,msgEl){
+  let acc="";
+  return {
+    onToken(delta){
+      if(msgEl.classList.contains("empty")){ msgEl.classList.remove("empty"); bubble.textContent=""; }
+      acc+=delta; bubble.textContent=acc;
+      $("chat-wrap").scrollTop=$("chat-wrap").scrollHeight;
+    }
+  };
 }
 async function ask(){
   const ta=$("q"); const q=ta.value.trim(); if(!q)return;
@@ -628,18 +645,22 @@ async function ask(){
       if(!hits?.length){
         m.classList.add("chatmode"); m.querySelector(".msg-name").textContent="tiseR · Chat";
         await ensureLLM();
-        const{text}=await llm.call({type:"generate",prompt:q,context:[],maxNewTokens:tok,systemPrompt:PROMPT_CHAT,history:chatHistory});
+        const sink=makeStreamSink(b,m);
+        const{text}=await llm.call({type:"generate",prompt:q,context:[],maxNewTokens:tok,systemPrompt:PROMPT_CHAT,history:chatHistory},sink.onToken);
         m.classList.remove("empty"); b.textContent=text; answer=text;
       } else {
         await ensureLLM();
-        const{text}=await llm.call({type:"generate",prompt:q,context:hits.map(h=>({source:h.source,content:h.text})),maxNewTokens:tok,systemPrompt:PROMPT_RAG,history:chatHistory});
+        const sink=makeStreamSink(b,m);
+        const ragHist=chatHistory.filter(h=>h.role==="user");   // Fix: keine Assistant-Antworten zurückfüttern (verhindert Namens-Recycling im RAG)
+        const{text}=await llm.call({type:"generate",prompt:q,context:hits.map(h=>({source:h.source,content:h.text})),maxNewTokens:tok,systemPrompt:PROMPT_RAG,history:ragHist},sink.onToken);
         m.classList.remove("empty"); b.textContent=text; answer=text; addSources(m,hits);
       }
     } else {
       const{m,b}=addMsg(null,"bot","chatmode");
       setStatus("antworte…","busy"); bar(30);
       await ensureLLM();
-      const{text}=await llm.call({type:"generate",prompt:q,context:[],maxNewTokens:tok,systemPrompt:PROMPT_CHAT,history:chatHistory});
+      const sink=makeStreamSink(b,m);
+      const{text}=await llm.call({type:"generate",prompt:q,context:[],maxNewTokens:tok,systemPrompt:PROMPT_CHAT,history:chatHistory},sink.onToken);
       m.classList.remove("empty"); b.textContent=text; answer=text;
     }
     // Turn ins Gedaechtnis; auf die letzten 6 Nachrichten (3 Paare) begrenzen.

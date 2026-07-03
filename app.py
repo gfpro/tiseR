@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-armachat - RAG-Backend (AppLocker-konform, KEINE nativen DLLs)
+tiseR - RAG-Backend   [Version 20260702v01] (AppLocker-konform, KEINE nativen DLLs)
 Optimierungen ggue. v1:
   1. Strukturbewusstes Chunking (Ueberschriften-Schnitte, ToC/Kopfzeilen entfernt,
      Ueberschrift als Praefix im Chunk).
@@ -44,7 +44,7 @@ HOST, PORT = "127.0.0.1", 8000
 CHUNK_TARGET = 500      # Ziel-Zeichen/Chunk: passt ins Embedding-Fenster (~128 Tokens)
 CHUNK_HARD   = 750      # harte Obergrenze
 CHUNK_MIN    = 15       # Mindestlaenge (sonst gehen kurze Folien beim Seiten-Flush verloren)
-TOP_K        = 6        # etwas mehr Treffer, da Chunks jetzt kleiner sind
+TOP_K        = 4      # 3-5 Quellen reichen; gezielte Antwort steckt nicht in 6
 RRF_K        = 60       # RRF-Konstante (Standardwert)
 PAGE_BREAK   = "\x0c"   # Seiten-/Foliengrenze -> harter Chunk-Schnitt
 # Metadaten-Boost: weicher, MULTIPLIKATIVER Faktor auf Chunks, deren Tags zum
@@ -237,6 +237,20 @@ def extract_csv_text(src) -> str:
         if line: out.append(line)
     return "\n".join(out)
 
+def _sender_label(raw: str) -> str:
+    """Lesbarer Absendername aus einem From-Header.
+    'Brechbühl Fabian <f.b@vbs.admin.ch>' -> 'Brechbühl Fabian'.
+    Fallback: lokaler Teil der Adresse."""
+    if not raw: return ""
+    raw = raw.strip()
+    m = re.match(r'\s*"?([^"<]+?)"?\s*<[^>]+>\s*$', raw)
+    if m:
+        name = m.group(1).strip().strip('"\'')
+        if name: return name
+    m = re.search(r'([\w.\-]+)@', raw)
+    if m: return m.group(1).replace(".", " ")
+    return raw
+
 def extract_eml_text(src) -> str:
     """Standard-E-Mail (RFC 822) via stdlib email."""
     import email
@@ -255,7 +269,12 @@ def extract_eml_text(src) -> str:
                 body = re.sub(r"<[^>]+>", " ", body)
     except Exception:
         body = ""
-    return "\n".join(head + ["", body.strip()])
+    # Absender als Markdown-Ueberschrift: der Chunker erkennt sie als 'head' und
+    # praefixt JEDEN Chunk dieser Mail -> "Ich" im Body bleibt ueber alle Chunks
+    # auf den Absender aufloesbar (Koreferenz-Fix, z.B. "Ich bin der EPIC-Owner").
+    sender_short = _sender_label(msg.get("From") or "")
+    md_head = [f"## Mail von {sender_short}"] if sender_short else []
+    return "\n".join(md_head + head + ["", body.strip()])
 
 # --------------------------------------------------------------- MSG (Outlook, binaeres OLE -> olefile, rein Python)
 try:
@@ -290,11 +309,13 @@ def extract_msg_text(src) -> str:
             if entry and entry[0].startswith("__recip_version1.0_"):
                 nm = _msg_prop(ole, "3001", prefix=entry[0] + "/")  # PR_DISPLAY_NAME
                 if nm: recips.append(nm)
+        sender_short = _sender_label(sender)
+        md_head = [f"## Mail von {sender_short}"] if sender_short else []
         head = []
         if sender:  head.append("Von: " + sender)
         if recips:  head.append("An: " + ", ".join(dict.fromkeys(recips)))
         if subject: head.append("Betreff: " + subject)
-        return "\n".join(head + ["", body.strip()])
+        return "\n".join(md_head + head + ["", body.strip()])
     finally:
         ole.close()
 

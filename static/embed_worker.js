@@ -1,5 +1,5 @@
 /**
- * tiseR — Embedding-Worker  (multilingual-e5-large-instruct, 1024-dim, WASM)
+ * tiseR — Embedding-Worker   [Version 20260702v01]  (multilingual-e5-large-instruct, 1024-dim, WASM)
  * Abgeleitet aus LoKI loki_embed_worker.js (bewährte Lade-Sequenz).
  *
  * WICHTIG bei E5-Modellen: Texte brauchen Praefixe, sonst geht der
@@ -69,7 +69,13 @@ async function loadModel() {
     env.localModelPath = '/models/';
     if (env.backends?.onnx?.wasm) {
       env.backends.onnx.wasm.wasmPaths = WASM_BASE;
-      env.backends.onnx.wasm.numThreads = 1;
+      // numThreads>1 erfordert SharedArrayBuffer -> verlangt COOP/COEP-Header,
+      // die app.py bereits setzt (Cross-Origin-Embedder-Policy: require-corp).
+      // Damit laeuft das Query-Embedding (e5-large int8) mehrfaedig statt
+      // single-thread -> spuerbar kuerzere Wartezeit VOR jeder RAG-Antwort.
+      // Faellt SharedArrayBuffer aus (Header fehlen), still auf 1 zuruckfallen.
+      env.backends.onnx.wasm.numThreads =
+        (typeof SharedArrayBuffer !== 'undefined') ? Math.min(4, (self.navigator?.hardwareConcurrency || 4)) : 1;
       env.backends.onnx.wasm.proxy = false;
     }
 
