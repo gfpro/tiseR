@@ -1,9 +1,11 @@
 /**
- * tiseR — LLM-Worker   [Version 20260702v01]
- * Modellunabhaengig: dtype wird aus den vorhandenen model_<dtype>.onnx-Dateien
- * ERKANNT (HEAD-Probe), nicht am Modellnamen hartcodiert. Neue Modelle unter
- * \models\ laufen ohne Codeaenderung.
- * Abgeleitet aus LoKI loki_worker.js. Greedy decoding fuer Faktentreue.
+ * tiseR — LLM-Worker   [Version 20260708v02]
+ * Modellunabhaengig: dtype wird aus den vorhandenen ONNX-Dateien ERKANNT
+ * (HEAD-Probe), nicht am Modellnamen hartcodiert. Erkennt BEIDE Namensschemata:
+ *   - Single-File CausalLM     -> model_<dtype>.onnx                   (z. B. LFM2-2.6B-Bund)
+ *   - Split ConditionalGen     -> decoder_model_merged_<dtype>.onnx    (z. B. Gemma 4 E4B)
+ * Beide laufen ueber dieselbe text-generation-Pipeline (wie in LoKI bewaehrt).
+ * Vision/Audio-Encoder werden von der text-generation-Pipeline NICHT geladen.
  *
  * Ablegen unter:  C:\tiseR\static\llm_worker.js
  */
@@ -14,10 +16,11 @@ const WASM_BASE = ORIGIN + '/static/transformersjs-420/';
 let MODEL_BASE  = ORIGIN + '/models/' + MODEL_NAME;
 let PROMPT_BUDGET = 3000;      // Gesamt-Zeichenbudget fuer den Kontext (modellunabhaengig)
 
-// dtype-Kandidaten in Praeferenzreihenfolge. Erstes im onnx\-Ordner vorhandenes
-// File gewinnt -> der Dateiname entscheidet (q4 vs q4f16 vs …), nicht der Name.
+// dtype-Kandidaten in Praeferenzreihenfolge. Erstes vorhandenes File gewinnt.
 const DTYPE_WEBGPU = ['q4f16', 'fp16', 'q4', 'q8', 'int8', 'uint8'];
 const DTYPE_WASM   = ['q4', 'uint8', 'q8', 'int8', 'q4f16'];
+// Dateinamen-Praefixe: Single-File ODER Gemma-Split.
+const ONNX_PREFIXES = ['model_', 'decoder_model_merged_'];
 
 let generator = null, loading = false, generating = false;
 const queue = [];
@@ -29,12 +32,13 @@ const SYSTEM_PROMPT =
   'Grundlage für die Antwort, sage das offen. Erfinde keine Fakten. ' +
   'Keine Emojis, keine Markdown-Formatierung.';
 
-// fetch()-Override (siehe embed_worker.js)
+// fetch()-Override: leitet Modell-Dateien nach /models/<name>/ um.
 const _origFetch = self.fetch.bind(self);
 self.fetch = function (url, opts) {
   let u = (typeof url === 'string') ? url : (url && url.url) ? url.url : String(url);
   if (u.indexOf(ORIGIN) >= 0 || u.endsWith('.wasm') || u.endsWith('.mjs')) return _origFetch(url, opts);
   const fname = u.split('?')[0].split('/').pop();
+  // .onnx UND .onnx_data / .onnx_data_1 (Split-Dateien) -> onnx\-Unterordner
   if (u.indexOf('.onnx') >= 0) return _origFetch(MODEL_BASE + '/onnx/' + fname, opts);
   const known = ['tokenizer.json','tokenizer_config.json','config.json',
                  'generation_config.json','special_tokens_map.json','vocab.json','merges.txt','added_tokens.json'];
@@ -65,15 +69,17 @@ async function drain() {
 
 let TextStreamer = null;   // wird beim Laden aus transformers.js geholt
 
-// Prueft per HEAD, welche model_<dtype>.onnx im onnx\-Ordner liegt. Erster
-// Treffer aus der Praeferenzliste gewinnt, sonst null. Rein dateigetrieben.
+// HEAD-Probe: welche <praefix><dtype>.onnx liegt im onnx\-Ordner? Erster Treffer
+// gewinnt. Deckt model_q4.onnx (LFM2) UND decoder_model_merged_q4f16.onnx (Gemma).
 async function detectDtype(device) {
   const list = (device === 'webgpu') ? DTYPE_WEBGPU : DTYPE_WASM;
   for (const dt of list) {
-    try {
-      const r = await _origFetch(MODEL_BASE + '/onnx/model_' + dt + '.onnx', { method: 'HEAD' });
-      if (r && r.ok) return dt;
-    } catch (_) { /* naechsten Kandidaten probieren */ }
+    for (const pre of ONNX_PREFIXES) {
+      try {
+        const r = await _origFetch(MODEL_BASE + '/onnx/' + pre + dt + '.onnx', { method: 'HEAD' });
+        if (r && r.ok) return dt;
+      } catch (_) { /* naechsten Kandidaten probieren */ }
+    }
   }
   return null;
 }
@@ -107,7 +113,7 @@ async function loadModel() {
     // dtype aus den TATSAECHLICH vorhandenen Dateien ableiten.
     let dtype = await detectDtype(device);
     if (!dtype) throw new Error(
-      'Keine model_*.onnx in /models/' + MODEL_NAME + '/onnx/ gefunden (gesucht: ' +
+      'Keine (decoder_model_merged_|model_)<dtype>.onnx in /models/' + MODEL_NAME + '/onnx/ gefunden (gesucht: ' +
       (device === 'webgpu' ? DTYPE_WEBGPU : DTYPE_WASM).join(', ') + ').');
     post('status', 'LLM lädt (' + device.toUpperCase() + ', ' + dtype + ')…', 5);
 
@@ -143,9 +149,7 @@ async function generate(job) {
   try {
     self.postMessage({ type: 'generating', requestId });
 
-    // Kontext proportional auf das Budget kürzen (LoKI A2).
-    // 3 statt 5 Chunks: kürzeres Prefill -> niedrigeres TTFT, kleinerer KV-Cache
-    // pro Decode-Schritt. Top-3 aus e5-large-Retrieval reichen praktisch immer.
+    // Kontext proportional auf das Budget kürzen (Top-3 aus e5-large-Retrieval).
     let ctxText = '';
     const ctx = (job.context || []).slice(0, 3);
     if (ctx.length) {
@@ -154,14 +158,11 @@ async function generate(job) {
       ctxText = ctx.map(c => '[' + (c.source || 'DOK') + ']\n' + (c.content || '').slice(0, perChunk)).join('\n\n---\n\n');
     }
 
-    // systemPrompt aus dem Job verwenden (ermoeglicht Chat- vs. RAG-Modus von index.html aus)
     const sysPrompt = job.systemPrompt || SYSTEM_PROMPT;
 
-    // Kurzzeitgedaechtnis: vorherige Q&A-Turns einfuegen.
-    // Im RAG-Modus konkurriert die Historie mit dem Dokumentbudget -> bewusst kuerzer.
     const rawHist = Array.isArray(job.history) ? job.history : [];
-    const maxTurns = ctxText ? 2 : 4;                 // RAG: 1 Paar, Chat: 2 Paare
-    const perHistChars = ctxText ? 220 : 400;         // einzelne Historien-Nachricht kappen
+    const maxTurns = ctxText ? 2 : 4;
+    const perHistChars = ctxText ? 220 : 400;
     const histMsgs = rawHist.slice(-maxTurns).map(h => ({
       role: (h.role === 'assistant' ? 'assistant' : 'user'),
       content: String(h.content || '').slice(0, perHistChars)
@@ -172,30 +173,22 @@ async function generate(job) {
       : { role: 'user', content: job.prompt };
     const messages = [{ role: 'system', content: sysPrompt }, ...histMsgs, currentUser];
 
-    // Token-Streaming: jedes dekodierte Stück sofort an die UI posten, statt auf
-    // die komplette Antwort zu warten. Reale Zeit bleibt gleich, aber das erste
-    // Wort erscheint nach ~1 s statt nach Minuten — das ist der grösste
-    // wahrgenommene Latenzgewinn. Faellt TextStreamer aus (alte tjs-Version),
-    // laeuft der Pfad ohne Streamer weiter (kein Bruch).
+    // Token-Streaming
     let streamer = null;
     if (TextStreamer && generator.tokenizer) {
       try {
         streamer = new TextStreamer(generator.tokenizer, {
           skip_prompt: true,
           skip_special_tokens: true,
-          callback_function: (txt) => {
-            if (txt) self.postMessage({ type: 'token', text: txt, requestId });
-          }
+          callback_function: (txt) => { if (txt) self.postMessage({ type: 'token', text: txt, requestId }); }
         });
       } catch (_) { streamer = null; }
     }
 
-    // Timeout: bei Streaming reicht ein knapperes Budget pro Token (220 ms),
-    // da haengende Generierung ohnehin am ausbleibenden Token-Strom sichtbar wird.
     const timeoutMs = Math.max(60000, tokenLimit * 220 + 15000);
     const genOpts = {
       max_new_tokens: tokenLimit, do_sample: false,      // greedy = faktentreuer
-      repetition_penalty: 1.0,                            // 1.0 = keine Ziffern werden verschluckt (9001 bleibt 9001)
+      repetition_penalty: 1.0,
     };
     if (streamer) genOpts.streamer = streamer;
     const result = await withTimeout(generator(messages, genOpts), timeoutMs);
@@ -212,13 +205,10 @@ async function generate(job) {
     answer = answer.split('<|im_end|>')[0].split('</s>')[0].split('<end_of_turn>')[0].trim();
     answer = answer.replace(/\*\*([^*]+)\*\*/g, '$1').replace(/^#{1,4}\s+/gm, '').trim();
 
-    // LFM2 haengt manchmal reflexhaft eine Fehlanzeige-Floskel an eine bereits
-    // vollstaendige Antwort. Diese NUR kappen, wenn klar substantieller Text
-    // davor steht — steht sie allein (echte Fehlanzeige), bleibt sie unangetastet.
     const noInfo = /\s*[-–•]?\s*(?:dazu\s+)?enthalten\s+die\s+dokumente\s+keine\s+(?:konkrete\s+)?angabe[.…]*\s*$/i;
     if (noInfo.test(answer)) {
       const stripped = answer.replace(noInfo, '').trim();
-      if (stripped.length >= 80) answer = stripped;   // genug Substanz davor -> Floskel war redundant
+      if (stripped.length >= 80) answer = stripped;
     }
 
     self.postMessage({ type: 'done', text: answer || '(leere Antwort)', requestId });
