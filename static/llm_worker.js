@@ -1,11 +1,21 @@
 /**
- * tiseR — LLM-Worker   [Version 20260708v02]
+ * tiseR — LLM-Worker   [Version 20260711v01]
  * Modellunabhaengig: dtype wird aus den vorhandenen ONNX-Dateien ERKANNT
  * (HEAD-Probe), nicht am Modellnamen hartcodiert. Erkennt BEIDE Namensschemata:
  *   - Single-File CausalLM     -> model_<dtype>.onnx                   (z. B. LFM2-2.6B-Bund)
  *   - Split ConditionalGen     -> decoder_model_merged_<dtype>.onnx    (z. B. Gemma 4 E4B)
+ *                                 + embed_tokens_<dtype>.onnx
  * Beide laufen ueber dieselbe text-generation-Pipeline (wie in LoKI bewaehrt).
  * Vision/Audio-Encoder werden von der text-generation-Pipeline NICHT geladen.
+ *
+ * NEU in dieser Version:
+ *  (1) Split-Modelle koennen PRO SESSION unterschiedliche dtypes haben
+ *      (z. B. embed_tokens=q4f16 stock, decoder_model_merged=q8 selbst exportiert).
+ *      detectDtypeMap() liefert dafuer ein {session: dtype}-Objekt statt eines Strings.
+ *  (2) Transformers.js mappt dtype 'q8' intern auf das Dateisuffix '_quantized'.
+ *      Unsere Dateien heissen '_q8'. Der fetch-Override uebersetzt zurueck, damit
+ *      NICHTS umbenannt werden muss (Umbenennen wuerde die .onnx_data-Referenz
+ *      im Graphen brechen).
  *
  * Ablegen unter:  C:\tiseR\static\llm_worker.js
  */
@@ -14,22 +24,30 @@ const ORIGIN    = self.location.origin;
 const TJS_URL   = ORIGIN + '/static/transformersjs-420/transformers.min.js';
 const WASM_BASE = ORIGIN + '/static/transformersjs-420/';
 let MODEL_BASE  = ORIGIN + '/models/' + MODEL_NAME;
-let PROMPT_BUDGET = 3000;      // Gesamt-Zeichenbudget fuer den Kontext (modellunabhaengig)
+let PROMPT_BUDGET = 1800;      // gesenkt: kuerzeres Prefill, schnelleres erstes Token
 
 // dtype-Kandidaten in Praeferenzreihenfolge. Erstes vorhandenes File gewinnt.
 const DTYPE_WEBGPU = ['q4f16', 'fp16', 'q4', 'q8', 'int8', 'uint8'];
 const DTYPE_WASM   = ['q4', 'uint8', 'q8', 'int8', 'q4f16'];
-// Dateinamen-Praefixe: Single-File ODER Gemma-Split.
-const ONNX_PREFIXES = ['model_', 'decoder_model_merged_'];
+
+// Stiller WASM-Fallback: laedt bei einem WebGPU-Fehler das GESAMTE Modell noch
+// einmal (bei Gemma 4 ~4 GB) und ueberdeckt dabei die urspruengliche Fehlermeldung.
+// Fuer die Fehlersuche auf false. Fuer den Produktivbetrieb ggf. wieder true.
+const ALLOW_WASM_FALLBACK = false;
+
+// DIAGNOSE: WebGPU erzwungen deaktivieren, um WebGPU-vs-CPU zu isolieren.
+// true = laeuft auf WASM/CPU (langsam!), false = normal (WebGPU wenn verfuegbar).
+const FORCE_WASM = false;
 
 let generator = null, loading = false, generating = false;
 const queue = [];
 
 const SYSTEM_PROMPT =
   'Du bist ein Assistent für interne Prozessdokumentation. Antworte auf Deutsch, ' +
-  'nur auf Basis der bereitgestellten Dokumente. Du darfst Informationen aus ' +
-  'mehreren Stellen kombinieren und zusammenfassen. Enthalten die Dokumente keine ' +
-  'Grundlage für die Antwort, sage das offen. Erfinde keine Fakten. ' +
+  'direkt und knapp. Beginne SOFORT mit der Antwort auf die Frage. Wiederhole NICHT ' +
+  'den Dokumenttext, den Dateinamen, den Titel oder die Quelle. Antworte nur auf Basis ' +
+  'der bereitgestellten Dokumente; du darfst mehrere Stellen kombinieren. Enthalten die ' +
+  'Dokumente keine Grundlage, sage das in einem Satz. Erfinde keine Fakten. ' +
   'Keine Emojis, keine Markdown-Formatierung.';
 
 // fetch()-Override: leitet Modell-Dateien nach /models/<name>/ um.
@@ -39,7 +57,12 @@ self.fetch = function (url, opts) {
   if (u.indexOf(ORIGIN) >= 0 || u.endsWith('.wasm') || u.endsWith('.mjs')) return _origFetch(url, opts);
   const fname = u.split('?')[0].split('/').pop();
   // .onnx UND .onnx_data / .onnx_data_1 (Split-Dateien) -> onnx\-Unterordner
-  if (u.indexOf('.onnx') >= 0) return _origFetch(MODEL_BASE + '/onnx/' + fname, opts);
+  if (u.indexOf('.onnx') >= 0) {
+    // Transformers.js uebersetzt dtype 'q8' in das Suffix '_quantized'.
+    // Unsere Dateien heissen '_q8' -> hier zurueckuebersetzen.
+    const fixed = fname.replace('_quantized.onnx', '_q8.onnx');
+    return _origFetch(MODEL_BASE + '/onnx/' + fixed, opts);
+  }
   const known = ['tokenizer.json','tokenizer_config.json','config.json',
                  'generation_config.json','special_tokens_map.json','vocab.json','merges.txt','added_tokens.json'];
   for (const k of known) if (fname === k || u.indexOf(k) >= 0) return _origFetch(MODEL_BASE + '/' + k, opts);
@@ -69,19 +92,36 @@ async function drain() {
 
 let TextStreamer = null;   // wird beim Laden aus transformers.js geholt
 
-// HEAD-Probe: welche <praefix><dtype>.onnx liegt im onnx\-Ordner? Erster Treffer
-// gewinnt. Deckt model_q4.onnx (LFM2) UND decoder_model_merged_q4f16.onnx (Gemma).
-async function detectDtype(device) {
+// HEAD-Probe fuer EINEN Dateipraefix: welcher dtype liegt vor?
+async function probePrefix(prefix, device) {
   const list = (device === 'webgpu') ? DTYPE_WEBGPU : DTYPE_WASM;
   for (const dt of list) {
-    for (const pre of ONNX_PREFIXES) {
-      try {
-        const r = await _origFetch(MODEL_BASE + '/onnx/' + pre + dt + '.onnx', { method: 'HEAD' });
-        if (r && r.ok) return dt;
-      } catch (_) { /* naechsten Kandidaten probieren */ }
-    }
+    try {
+      const r = await _origFetch(MODEL_BASE + '/onnx/' + prefix + dt + '.onnx', { method: 'HEAD' });
+      if (r && r.ok) return dt;
+    } catch (_) { /* naechsten Kandidaten probieren */ }
   }
   return null;
+}
+
+// Liefert entweder:
+//   - String            -> Single-File-Modell (model_<dtype>.onnx), z. B. LFM2
+//   - {session: dtype}  -> Split-Modell, dtype PRO SESSION (z. B. Gemma 4)
+//   - null              -> nichts gefunden
+async function detectDtypeMap(device) {
+  const dec = await probePrefix('decoder_model_merged_', device);
+  if (dec) {
+    const emb = await probePrefix('embed_tokens_', device);
+    if (!emb) throw new Error(
+      'decoder_model_merged_' + dec + '.onnx gefunden, aber KEIN embed_tokens_<dtype>.onnx ' +
+      'im selben Ordner (/models/' + MODEL_NAME + '/onnx/). Split-Modell ist unvollstaendig.');
+    return { embed_tokens: emb, decoder_model_merged: dec };
+  }
+  return await probePrefix('model_', device);   // String oder null
+}
+
+function dtypeLabel(dt) {
+  return (typeof dt === 'string') ? dt : JSON.stringify(dt);
 }
 
 async function loadModel() {
@@ -107,15 +147,29 @@ async function loadModel() {
 
     // WebGPU verfuegbar?
     let device = 'wasm';
-    if (self.navigator && self.navigator.gpu) {
-      try { if (await self.navigator.gpu.requestAdapter()) device = 'webgpu'; } catch (_) {}
+    if (!FORCE_WASM && self.navigator && self.navigator.gpu) {
+      try {
+        const adapter = await self.navigator.gpu.requestAdapter();
+        if (adapter) {
+          device = 'webgpu';
+          // DIAGNOSE: Die harten GPU-Grenzen ausgeben. Gemma 4 q4f16 braucht
+          // ~2.9 GB Decoder + ~2.0 GB Embed. Wenn maxBufferSize oder
+          // maxStorageBufferBindingSize darunter liegen, kann es nicht klappen.
+          const L = adapter.limits || {};
+          console.log('=== WebGPU-Limits ===');
+          console.log('maxBufferSize:               ', L.maxBufferSize, '(' + (L.maxBufferSize / 1e9).toFixed(2) + ' GB)');
+          console.log('maxStorageBufferBindingSize: ', L.maxStorageBufferBindingSize, '(' + (L.maxStorageBufferBindingSize / 1e9).toFixed(2) + ' GB)');
+          console.log('maxComputeWorkgroupStorageSize:', L.maxComputeWorkgroupStorageSize);
+        }
+      } catch (e) { console.warn('requestAdapter fehlgeschlagen:', e); }
     }
-    // dtype aus den TATSAECHLICH vorhandenen Dateien ableiten.
-    let dtype = await detectDtype(device);
+
+    // dtype(s) aus den TATSAECHLICH vorhandenen Dateien ableiten.
+    const dtype = await detectDtypeMap(device);
     if (!dtype) throw new Error(
       'Keine (decoder_model_merged_|model_)<dtype>.onnx in /models/' + MODEL_NAME + '/onnx/ gefunden (gesucht: ' +
       (device === 'webgpu' ? DTYPE_WEBGPU : DTYPE_WASM).join(', ') + ').');
-    post('status', 'LLM lädt (' + device.toUpperCase() + ', ' + dtype + ')…', 5);
+    post('status', 'LLM lädt (' + device.toUpperCase() + ', ' + dtypeLabel(dtype) + ')…', 5);
 
     try {
       generator = await pipeline('text-generation', MODEL_NAME, {
@@ -123,9 +177,19 @@ async function loadModel() {
         progress_callback: (p) => post('status', 'LLM lädt ' + (p.progress ? Math.round(p.progress) : 0) + '%…', p.progress || 0)
       });
     } catch (err) {
-      if (device === 'webgpu') {
-        const wdt = await detectDtype('wasm');
-        post('status', 'GPU n/a — lade auf CPU (' + (wdt || '?') + ')…', 5);
+      // DIAGNOSE: den ECHTEN Grund sichtbar machen, bevor irgendein Fallback greift.
+      console.error('=== LADEFEHLER (' + device + ') ===');
+      console.error('name:   ', err && err.name);
+      console.error('message:', err && err.message);
+      console.error('stack:  ', err && err.stack);
+      console.error('object: ', err);
+
+      // WASM-Fallback laedt ~4 GB EIN ZWEITES MAL und verschluckt dabei den
+      // eigentlichen Fehler. Fuer die Diagnose: aus. Auf true setzen, wenn der
+      // CPU-Pfad wirklich gewuenscht ist.
+      if (ALLOW_WASM_FALLBACK && device === 'webgpu') {
+        const wdt = await detectDtypeMap('wasm');
+        post('status', 'GPU n/a — lade auf CPU (' + (wdt ? dtypeLabel(wdt) : '?') + ')…', 5);
         if (!wdt) throw err;
         generator = await pipeline('text-generation', MODEL_NAME, {
           dtype: wdt, device: 'wasm',
@@ -185,7 +249,7 @@ async function generate(job) {
       } catch (_) { streamer = null; }
     }
 
-    const timeoutMs = Math.max(60000, tokenLimit * 220 + 15000);
+    const timeoutMs = Math.max(180000, tokenLimit * 400 + 30000);
     const genOpts = {
       max_new_tokens: tokenLimit, do_sample: false,      // greedy = faktentreuer
       repetition_penalty: 1.0,
