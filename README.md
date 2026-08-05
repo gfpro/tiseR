@@ -1,389 +1,343 @@
-# tiseR
-Tiny Secure RAG
+# tiseR — tiny secure RAG
 
-**Vollständig lokaler, offline-fähiger RAG-Chatbot.** Dokumente einlesen, semantisch
-durchsuchen und vom LLM beantworten lassen — ohne Cloud, ohne Internet, ohne native
-DLLs. Embedding und Sprachmodell laufen im Browser (Transformers.js / WebGPU mit
-WASM-Fallback); das Python-Backend (Flask) übernimmt Extraktion, Chunking und
-hybride Suche.
+Lokales RAG-/Dokumentenintelligenz-System für Arbeitsplätze ohne Adminrechte,
+ohne Docker und ohne Internetzugang zur Laufzeit. Dokumente → strukturbewusste
+Chunks → Embedding im Browser → Hybrid-Retrieval in Python → Antwort eines
+lokalen LLM ausschliesslich aus dem gefundenen Kontext.
 
-Entwickelt für eine restriktive Windows-Umgebung: **Python 3.10, keine
-Adminrechte, AppLocker-Whitelist, kein Internet zur Laufzeit, keine `.pyd`/`.dll`.**
-Alle Python-Abhängigkeiten sind reines Python.
+**Alles läuft auf dem eigenen Rechner. Es verlässt kein Byte die Maschine.**
 
 ---
 
-## Inhalt
+## Warum diese Architektur so aussieht, wie sie aussieht
 
-- [Funktionen](#funktionen)
-- [Architektur](#architektur)
-- [Voraussetzungen](#voraussetzungen)
-- [Repository-Struktur](#repository-struktur)
-- [Installation](#installation)
-  - [1. Code ablegen](#1-code-ablegen)
-  - [2. Python-Abhängigkeiten (offline)](#2-python-abhängigkeiten-offline)
-  - [3. Transformers.js bereitstellen](#3-transformersjs-bereitstellen)
-  - [4. Modelle bereitstellen](#4-modelle-bereitstellen)
-  - [5. Starten](#5-starten)
-  - [6. Desktop-Verknüpfung](#6-desktop-verknüpfung)
-- [Dokumente für das RAG ablegen](#dokumente-für-das-rag-ablegen)
-- [Bedienung](#bedienung)
-- [Konfiguration](#konfiguration)
-- [Troubleshooting](#troubleshooting)
+Die Zielumgebung (Bundesrechner unter AppLocker-Whitelist) verbietet nativen
+Code. Das ist keine Vorsichtsmassnahme, sondern eine harte Grenze:
 
----
+| Blockiert | Grund |
+|---|---|
+| `onnxruntime` (Python), `torch`, `faiss` | native `.pyd`/`.dll` |
+| `pdfminer.six` | Abhängigkeit `cryptography` (nativ) |
+| `rank_bm25` | Abhängigkeit `numpy` (nativ) |
+| `.bat`-Dateien aus nicht-freigegebenen Pfaden | AppLocker-Regel |
+| `webbrowser.open()`, COM/PowerShell-.NET-Aufrufe | prozessgestarteter Fremdcode |
+| Docker | nicht installierbar |
 
-## Funktionen
+**Konsequenz:** Die gesamte ML-Inferenz läuft im Browser über Transformers.js
+(ONNX Runtime Web, WebGPU mit WASM-Fallback). Python macht nur Dateiparsing,
+Chunking, Suche und HTTP — mit reiner Standardbibliothek plus drei Wheels.
 
-- **100 % lokal/offline** — keine externen Aufrufe zur Laufzeit.
-- **Hybrid-Retrieval** — Pure-Python BM25 (numpy-frei) + Cosine-Similarity,
-  fusioniert via Reciprocal Rank Fusion (RRF).
-- **Strukturbewusstes Chunking** — Überschriften-Schnitte, ToC-/Kopf-/Fusszeilen
-  werden entfernt, Seiten-/Foliengrenzen als harte Schnitte erhalten.
-- **Viele Formate** — PDF, DOCX, XLSX, PPTX, CSV, TXT, EML, MSG.
-  Office-Formate (DOCX/XLSX/PPTX) werden via stdlib `zipfile` + `ElementTree`
-  geparst — **kein** `python-docx`/`openpyxl`/`lxml` (jeweils native DLLs).
-- **Browser-seitige ML** — Embedding (`multilingual-e5-large-instruct`, 1024-dim,
-  int8) und LLM laufen über Transformers.js im Web-Worker.
-- **Persistenz** — Vektoren in SQLite, BM25-Index wird beim Start neu aufgebaut.
-- **Chat- und RAG-Modus** — ohne Dokumente reiner Chat, mit Dokumenten RAG;
-  Quellen werden pro Antwort ausklappbar angezeigt.
-
-> **Hinweis zur Faktentreue:** Das LLM dekodiert greedy (`do_sample: false`) mit
-> `repetition_penalty: 1.0`. Letzteres ist Absicht — jeder Wert > 1.0 lässt greedy
-> wiederholte Ziffern bestrafen und korrumpiert Zahlen (z. B. „ISO 9001" → „ISO 901").
-
----
-
-## Architektur
-
-```
-Browser (Edge)                         Python-Backend (Flask, app.py)
-┌──────────────────────────┐           ┌──────────────────────────────────┐
-│ index.html               │           │ Extraktion (pypdf, zipfile, …)   │
-│  ├─ embed_worker.js  ────┼─ Vektoren─┼─▶ Chunking (strukturbewusst)     │
-│  │   (e5-large, WASM)    │           │   Speicherung (SQLite)           │
-│  └─ llm_worker.js        │  Suche ◀──┼── Hybrid: BM25 + Cosine (RRF)    │
-│      (Gemma/LFM2,        │           │                                  │
-│       WebGPU/WASM)       │  Kontext─▶│   /api/search liefert Top-K      │
-└──────────────────────────┘           └──────────────────────────────────┘
-```
-
-Embedding und Generierung passieren **im Browser**, nicht in Python. Deshalb
-enthält `requirements.txt` bewusst kein `torch`/`onnxruntime`/`faiss`.
-
----
-
-## Voraussetzungen
-
-- **Windows** mit **Python 3.10** (getestet; andere 3.x-Versionen vermutlich ok,
-  aber ungetestet).
-- **Microsoft Edge** (oder ein anderer Chromium-Browser mit WebGPU; ohne WebGPU
-  greift automatisch der WASM-Fallback — langsamer, aber funktionsfähig).
-- Genügend Platz für die Modelldateien (Embedder ~535 MB, LLM je nach Modell
-  mehrere GB).
-- Die Modelldateien und das Transformers.js-Bundle **sind nicht Teil dieses
-  Repos** und müssen separat bereitgestellt werden (siehe unten).
-- BIT-Client der neueren Generation (Intel Core Ultra 5 225U mit iGPU).
-
----
-
-## Repository-Struktur
-
-```
-tiseR/
-├─ app.py                 # Flask-Backend: Extraktion, Chunking, Suche, API
-├─ index.html             # Frontend (im Hauptordner, nicht in static/)
-├─ requirements.txt       # Flask, pypdf, olefile  (alles reines Python)
-├─ setup_shortcut.py      # erzeugt die Desktop-Verknüpfung lokal
-├─ eval_harness.py        # misst Retrieval-Recall@k (optional, Entwicklung)
-├─ README.md
-│
-├─ static/
-│  ├─ embed_worker.js     # Embedding-Worker (e5-large)
-│  ├─ llm_worker.js       # LLM-Worker (Gemma/LFM2)
-│  └─ transformersjs-420/ # ⟵ MUSS bereitgestellt werden (Transformers.js + WASM)
-│
-├─ models/                # ⟵ MUSS bereitgestellt werden (Embedder + LLM[s])
-│  ├─ multilingual-e5-large-instruct/
-│  ├─ gemma-4-E2B-it/      (Beispiel)
-│     └─ onnx/
-│
-└─ data/                  # ⟵ hier die RAG-Dokumente ablegen
-```
-
-> `static/transformersjs-420/`, `models/` und `data/` werden **nicht** mit
-> ausgeliefert. Sie stehen in `.gitignore` (siehe unten) und müssen lokal befüllt
-> werden.
-
-- [Transformers.js v4.2](https://github.com/huggingface/transformers.js/releases)
+Alles, was im Code seltsam aussieht, hat hier seine Ursache: DOCX/XLSX/PPTX
+werden mit `zipfile` + `xml.etree` gelesen statt mit `python-docx`/`openpyxl`,
+BM25 ist von Hand in reinem Python implementiert, und der Start erfolgt über
+eine manuell erstellte `.lnk`.
 
 ---
 
 ## Installation
 
-### 1. Code ablegen
+### 1. Python
 
-Repo klonen oder ZIP entpacken nach `C:\tiser`:
-
-```
-C:\tiser\
-├─ app.py
-├─ index.html
-├─ requirements.txt
-└─ …
-```
-
-> Der Standard-Installationspfad in dieser Anleitung ist `C:\tiser`. Wenn du einen
-> anderen Pfad nutzt, passe ihn in der Verknüpfung (Schritt 6) entsprechend an.
-
-### 2. Python-Abhängigkeiten (offline)
-
-`requirements.txt` enthält ausschliesslich reines Python (AppLocker-konform):
+Python 3.10 aus dem Software-Kiosk. Prüfen:
 
 ```
-Flask==3.0.3
-pypdf==5.9.0
-olefile==0.47    # nur für .msg (binäres Outlook-OLE); optional
+python --version
 ```
 
-Auf einem Rechner **mit** Internet die Wheels herunterladen, auf den Zielrechner
-übertragen und dort offline installieren:
+### 2. Repo ablegen
 
-```bat
-:: Rechner mit Internet
+Nach `C:\tiseR\`. **Achtung beim Laufwerkswechsel in CMD:** `cd C:\tiseR` von
+`H:\` aus wechselt das Laufwerk *nicht*. Korrekt ist:
+
+```
+cd /d C:\tiseR
+```
+
+### 3. Abhängigkeiten (offline)
+
+Auf einem Rechner **mit** Internet:
+
+```
 pip download -r requirements.txt -d wheels
+```
 
-:: Wheels auf den Zielrechner kopieren, dann dort:
+Auf dem Zielrechner:
+
+```
+cd /d C:\tiseR
 pip install --no-index --find-links wheels -r requirements.txt
 ```
 
-`olefile` ist optional: Fehlt es, funktionieren alle anderen Formate weiter; nur
-`.msg` meldet dann einen klaren Hinweis.
+Nur gebaute `.whl`-Dateien funktionieren — Source-Distributionen (`.tar.gz`)
+scheitern, weil sie einen Build-Schritt bräuchten. Fehlende transitive
+Abhängigkeiten tauchen einzeln auf; sie gehören danach in `requirements.txt`.
 
-### 3. Transformers.js bereitstellen
+Der Ordner `wheels\` ist im Repo eingecheckt, damit Schritt 1 entfallen kann.
 
-Die Worker laden Transformers.js und die ONNX-Runtime-WASM-Backends lokal aus:
+### 4. Transformers.js
 
-```
-static/transformersjs-420/
-├─ transformers.min.js     # von den Workern als Modul importiert
-└─ … (ort-*.wasm, *.mjs)   # ONNX-Runtime-Web WASM-Backend
-```
+Liegt als `static\transformersjs-420\` im Repo. Diese Dateien stammen aus den
+npm-Paketen `@huggingface/transformers` und `onnxruntime-web` — beide werden
+als `.tgz` über npm verteilt, nicht über PyPI. Die exakte
+`onnxruntime-web`-Version steht in `package/package.json` unter `dependencies`.
 
-Die Worker erwarten genau diesen Ordnernamen (`transformersjs-420`, entspricht der
-verwendeten Transformers.js-Version 4.2.x). Lege das vollständige Distributions-
-Bundle inkl. der `.wasm`-/`.mjs`-Dateien dort ab. Die WASM-Pfade werden im Worker
-auf diesen Ordner gesetzt (`numThreads: 1`, `proxy: false`).
+**Sie sind absichtlich eingecheckt**, weil Dev-Releases von `onnxruntime-web`
+aus der npm-Registry verschwinden können.
 
-> Wenn du eine andere Version verwenden willst, ändere `TJS_URL`/`WASM_BASE` in
-> `static/embed_worker.js` **und** `static/llm_worker.js` und benenne den Ordner
-> konsistent um.
+### 5. Modelle
 
-### 4. Modelle bereitstellen
+Modelle liegen **nicht** im Repo (zu gross). Sie müssen manuell nach
+`C:\tiseR\models\` kopiert werden. Details unten.
 
-Alle Modelle liegen unter `models/`. **Pro Modell ein Ordner**, die `.onnx`-Dateien
-im Unterordner `onnx/`, der Rest (Tokenizer, Config) direkt im Modellordner.
-
-#### a) Embedding-Modell (Pflicht)
-
-Ohne Embedder läuft nichts. Erwartet wird `multilingual-e5-large-instruct`
-(1024-dim, int8):
+### 6. Start
 
 ```
-models/multilingual-e5-large-instruct/
-├─ onnx/
-│  └─ model_quantized.onnx        # int8 / q8, ~535 MB  (dtype 'q8' fragt genau diese Datei an)
-├─ tokenizer.json
-├─ tokenizer_config.json
-├─ config.json
-├─ special_tokens_map.json
-└─ sentencepiece.bpe.model         # falls vom Tokenizer benötigt
-```
-
-Heisst die `.onnx`-Datei anders oder liegt nicht im `onnx/`-Unterordner, passe den
-`fetch`-Override / `dtype` oben in `static/embed_worker.js` an.
-
-> E5-Modelle brauchen Präfixe (`passage:` für Dokumente, eine Instruct-Vorlage für
-> Anfragen). Das macht der Worker zentral — das Backend muss davon nichts wissen.
-
-#### b) Sprachmodell(e) (Pflicht, mindestens eines)
-
-Beliebig viele LLM-Ordner unter `models/`. Jedes erscheint im Dropdown der
-Oberfläche (Embedder werden anhand des Namensmusters automatisch ausgeschlossen).
-Erwartete Dateien pro LLM:
-
-```
-models/<LLM-NAME>/
-├─ onnx/
-│  ├─ model_q4f16.onnx     # für WebGPU   (dtype 'q4f16')
-│  └─ model_uint8.onnx     # CPU/WASM-Fallback (dtype 'uint8')
-├─ tokenizer.json
-├─ tokenizer_config.json
-├─ config.json
-├─ generation_config.json
-├─ special_tokens_map.json
-└─ (vocab.json, merges.txt, added_tokens.json — je nach Modell)
-```
-
-- **WebGPU vorhanden** → `model_q4f16.onnx` wird verwendet (schnell).
-- **Kein WebGPU** → automatischer Fallback auf `model_uint8.onnx` (langsamer).
-
-Stelle mindestens die zur Hardware passende Variante bereit. Beispiele für LLM-
-Ordnernamen: `gemma-4-E2B-it` (klein/schnell), `gemma-4-E4B-it` (grösser/besser),
-oder ein LFM2-Modell.
-
-Modelle (bevorzugt LFM2-Bund):
-
-- [Apertus-v1.1-4B-Instruct](https://huggingface.co/onnx-community/Apertus-v1.1-4B-Instruct-ONNX)
-- [Gemma 4 E2B](https://huggingface.co/onnx-community/gemma-4-E2B-it-ONNX)
-- [Gemma 4 E4B](https://huggingface.co/onnx-community/gemma-4-E4B-it-ONNX)
-- [LFM2-2.6B](https://huggingface.co/onnx-community/LFM2-2.6B-ONNX)
-- [LFM2-Bund (trainiertes Modell)](https://huggingface.co/gfp78/lfm2-bund-onnx-v2)
-- [LFM2-MoE-8B-A1B](https://huggingface.co/LiquidAI/LFM2-8B-A1B-ONNX)
-  
-
-> **Wichtig:** Lege **kein** Embedding-Modell ohne erkennbares Namensmuster in
-> `models/` ab. Das Backend filtert Embedder am Namen (`e5-`, `minilm`, `embed`,
-> `bge`, `gte-`, `nomic`, `sentence`). Ein Embedder, der diesem Muster nicht
-> entspricht, taucht sonst fälschlich als „LLM" im Dropdown auf und produziert
-> Kauderwelsch.
-
-### 5. Starten
-
-> ⚠️ **Häufigster Fehler:** `index.html` **nicht** doppelklicken. Unter `file://`
-> kann der Browser keine Web-Worker starten („SecurityError … origin 'null'").
-> **Immer** über den Server starten.
-
-```bat
-cd C:\tiser
+cd /d C:\tiseR
 python app.py
 ```
 
-Dann in **Edge** öffnen: **http://localhost:8000**
+Dann in Edge: **http://localhost:8000**
 
-Das Backend lauscht auf `127.0.0.1:8000`. Beim ersten Start entsteht die
-Datenbankdatei im Anwendungsordner. Zum Beenden das Konsolenfenster schliessen.
+> **Der häufigste Fehler:** `index.html` doppelklicken. Unter `file://` darf der
+> Browser keine Web-Worker starten („SecurityError … origin 'null'"). Immer über
+> den Server.
 
-### 6. Desktop-Verknüpfung
-
-Ein einzelner Doppelklick auf eine `.lnk`-Verknüpfung startet den Server. Unter
-AppLocker ist eine Verknüpfung, die **direkt auf `python.exe`** zeigt, die
-zuverlässigste Einzelklick-Methode.
-
-> ⚠️ **Lege keine fertige `.lnk` ins Repo.** Eine Windows-Verknüpfung bettet beim
-> Erstellen rechnerspezifische Daten ein (Konto-SID, Rechnername, teils MAC). Eine
-> committete `.lnk` veröffentlicht diese Fingerprints. Jeder Nutzer erzeugt die
-> Verknüpfung **lokal** — entweder per Skript oder manuell.
-
-**Variante A — per Skript:**
-
-```bat
-cd C:\tiser
-python setup_shortcut.py
-```
-
-Das Skript ermittelt den echten Desktop-Pfad (funktioniert auch bei umgeleiteten
-Desktops auf Netzlaufwerken) und legt dort die Verknüpfung an.
-
-> Falls `setup_shortcut.py` noch auf einen alten Pfad/Namen zeigt, anpassen:
-> ```python
-> SCRIPT  = r"C:\tiser\app.py"
-> WORKDIR = r"C:\tiser"
-> # und Join-Path …  'tiseR.lnk'
-> ```
-
-**Variante B — manuell:**
-Rechtsklick auf den Desktop → *Neu* → *Verknüpfung*, mit folgenden Werten:
-
-| Feld               | Wert                                         |
-|--------------------|----------------------------------------------|
-| **Ziel**           | `C:\Program Files\Python310\python.exe`      |
-| **Argumente**      | `"C:\tiser\app.py"`                           |
-| **Ausführen in**   | `C:\tiser`                                    |
-| **Name**           | `tiseR`                                       |
-
-(Den Python-Pfad ggf. an die eigene Installation anpassen.)
-
-Doppelklick auf die Verknüpfung startet den Server und öffnet den Browser.
+Für einen Doppelklick-Start: Rechtsklick auf Desktop → Neu → Verknüpfung,
+Ziel `C:\...\python.exe`, Argument `"C:\tiseR\app.py"`, Arbeitsverzeichnis
+`C:\tiseR`. Das ist unter AppLocker der einzige funktionierende Weg —
+`.bat`-Dateien und programmatisch erzeugte Verknüpfungen scheitern.
 
 ---
 
-## Dokumente für das RAG ablegen
-
-Lege die zu durchsuchenden Dokumente in den Ordner **`data\`** im Anwendungsordner:
+## Ordnerstruktur
 
 ```
-C:\tiser\data\
-├─ handbuch.pdf
-├─ prozesse.docx
-└─ …
+C:\tiseR\
+├─ app.py                  Flask-Backend, Chunking, Hybrid-Suche
+├─ index.html              UI (liegt im HAUPTordner, nicht in static\)
+├─ eval_harness.py         Retrieval-Messung gegen das Golden-Set
+├─ requirements.txt
+├─ README.md
+├─ armachat.db             entsteht beim 1. Start  (Umbenennung offen, s. u.)
+├─ data\                   PDFs etc. für "Ordner data\ einlesen"
+├─ wheels\                 Offline-Installation
+├─ static\
+│  ├─ embed_worker.js
+│  ├─ llm_worker.js
+│  └─ transformersjs-420\
+└─ models\
+   ├─ multilingual-e5-large\      Embedder — PFLICHT
+   ├─ LFM2-2.6B-Bund\             LLM (Fine-Tune, primär)
+   └─ <weitere LLMs>\             erscheinen automatisch im Dropdown
 ```
 
-Unterstützte Formate: **PDF · DOCX · XLSX · PPTX · CSV · TXT · EML · MSG**.
+---
 
-Einlesen über die Oberfläche: Button **„Ordner data\ einlesen"**. Bereits
-indizierte Dateien werden anhand des Dateinamens übersprungen. Einzelne Dateien
-können alternativ direkt über **„Laden"** hochgeladen werden.
+## Modelle beschaffen
 
-> **Empfehlung:** Office-Originale (DOCX/PPTX/XLSX) liefern saubere Struktur und
-> Tabellen. PDF-Exporte derselben Inhalte verlieren oft Struktur — wenn das
-> Original vorliegt, dieses bevorzugen.
+### Embedder (Pflicht)
 
-**Dokumente aktualisieren:** Neue Dateien in `data\` legen und erneut einlesen. Für
-einen kompletten Neuaufbau die Datenbankdatei löschen und neu einlesen — die
-Modelle bleiben unberührt.
+`Xenova/multilingual-e5-large` — 1024 Dimensionen, int8.
+
+Nach `models\multilingual-e5-large\` gehören genau diese Dateien:
+
+```
+multilingual-e5-large\
+├─ onnx\
+│  └─ model_quantized.onnx      ~562 MB   (selbstenthalten, kein External Data)
+├─ config.json
+├─ tokenizer.json
+├─ tokenizer_config.json
+├─ special_tokens_map.json
+└─ sentencepiece.bpe.model
+```
+
+**Nicht** herunterladen: `model.onnx`, `model.onnx_data`, `model_fp16.onnx` —
+zusammen über 3,9 GB, die nie angefragt werden.
+
+Die Tokenizer-Dateien liegen im **Hauptordner**, nur die `.onnx` in `onnx\`.
+Der Ordnername muss exakt der Konstante `EMBED_MODEL` in
+`static\embed_worker.js` entsprechen, sonst gibt es einen 404 auf `config.json`
+und der Embedder lädt nie.
+
+> **Instruct-Variante:** Es existiert auch `multilingual-e5-large-instruct`.
+> Die beiden sind architektonisch identisch, brauchen aber unterschiedliche
+> Query-Präfixe (`query: ` vs. eine Instruct-Vorlage). Beim Modellwechsel muss
+> `QUERY_MODE` in `embed_worker.js` mitgezogen werden — und die Dokumente
+> müssen neu indiziert werden.
+
+### LLM
+
+Beliebig viele Modelle unter `models\`. Sie erscheinen automatisch im Dropdown;
+im Code steht kein Modellname. Ordner, deren Name auf einen Embedder hindeutet
+(`e5-`, `minilm`, `bge`, `embed`, …), werden ausgefiltert.
+
+Der Worker erkennt selbst, welche Quantisierung vorliegt, und probiert in
+dieser Reihenfolge:
+
+- **WebGPU:** `q4f16` → `q4` → `fp16` → `q8` → `int8` → `uint8`
+- **WASM:** `q4` → `uint8` → `q8` → `int8` → `q4f16`
+
+Unterstützt werden beide Namensschemata:
+
+```
+model_<dtype>.onnx                          Single-File (LFM2)
+decoder_model_merged_<dtype>.onnx  +  embed_tokens_<dtype>.onnx   Split (Gemma 4)
+```
+
+#### External Data — die häufigste Fehlerquelle
+
+Überschreitet ein ONNX-Graph 2 GB, erlaubt das Protobuf-Format keine einzelne
+Datei mehr. Die Gewichte werden dann ausgelagert, und die `.onnx` ist nur noch
+ein Stub von 200–300 kB:
+
+```
+model_q4f16.onnx           222 kB    ← nur der Graph, allein nutzlos
+model_q4f16.onnx_data     1.06 GB
+model_q4f16.onnx_data_1    470 MB
+```
+
+**Alle Shards müssen mit.** Fehlt einer, lehnt der Worker die Variante ab und
+nennt die fehlende Datei — statt mitten im Laden abzustürzen.
+
+#### Grössenobergrenze
+
+ONNX Runtime Web läuft in 32-Bit-WASM: der adressierbare Heap endet bei 4 GiB,
+unabhängig vom System-RAM. Gewichte werden beim Laden durch diesen Heap
+gestaget, auch wenn sie danach auf der GPU landen. Dazu kommt
+`maxBufferSize` (typisch 2 GiB pro Buffer).
+
+**Praktische Obergrenze: rund 3,4 GB Gesamtgewichte**, entsprechend etwa
+4–6 Mrd. Parametern in q4. Der Worker prüft das vorab und lehnt zu grosse
+Modelle mit klarer Meldung ab.
+
+Modelle darüber — auch MoE-Modelle wie LFM2.5-8B-A1B — sind mit dieser Runtime
+nicht lauffähig. **MoE reduziert den Rechenaufwand pro Token, nicht den
+Speicherbedarf:** alle Experten müssen geladen sein, nur ein Bruchteil rechnet.
 
 ---
 
 ## Bedienung
 
-- **Modell wählen:** Dropdown oben rechts. Modellwechsel lädt das Modell beim
-  nächsten Senden neu. Optional **„Modell laden"** zum Vorab-Laden.
-- **Fragen:** unten eintippen, *Enter* zum Senden (*Shift+Enter* = Zeilenumbruch).
-- **Modus:** Ohne indizierte Dokumente → **Chat**. Mit Dokumenten → **RAG**
-  (Antwort nur aus dem Kontext, Quellen ausklappbar).
-- **Dokumente verwalten:** Dokumenten-Icon / **+** öffnet das Verwaltungsfenster
-  (Liste mit Chunk-Anzahl, Einzel-Löschung, „Alle löschen").
-- **Kurzzeitgedächtnis:** Die letzten Q&A-Turns fliessen in den Prompt ein.
+- **Dokumente:** Icon links oder `+` im Eingabefeld. Einzeldateien über
+  „Laden", ganze Ordner über „Ordner data\ einlesen" (bereits indizierte
+  Dateien werden anhand des Dateinamens übersprungen).
+- **Modell wählen:** Dropdown oben rechts. „Modell laden" lädt es vorab,
+  damit die erste Frage nicht wartet.
+- **Fragen:** unten eintippen, Enter.
+- **Modus:** Ohne indizierte Dokumente antwortet tiseR als reiner Chat.
+  Mit Dokumenten läuft RAG — sichtbar am Hinweis unter dem Eingabefeld.
+
+### Unterstützte Formate
+
+PDF · DOCX · XLSX · PPTX · CSV · TXT · EML · MSG · MD
+
+Office-Originale liefern messbar besseres Retrieval als PDF-Exporte derselben
+Datei — insbesondere bei PowerPoint. Wo das Original verfügbar ist, sollte es
+verwendet werden.
+
+### Suchsyntax
+
+Frei mit normalen Fragen kombinierbar. Ohne Operator verhält sich alles wie
+eine gewöhnliche Frage.
+
+| Ausdruck | Wirkung |
+|---|---|
+| `tags:frist` | nur Chunks mit diesem Tag (`frist`, `schwellenwert`, `zustaendigkeit`) |
+| `source:BöB` | nur Dokumente, deren Name den Begriff enthält |
+| `filename:*.pdf` | Dateiname nach Glob-Muster |
+| `"genaue Phrase"` | muss wörtlich vorkommen |
+| `/CHF \d+/` | regulärer Ausdruck im Text |
+| `-Intranet` bzw. `NOT Intranet` | Wort ausschliessen |
 
 ---
 
-## Konfiguration
+## Wie die Suche funktioniert
 
-Zentrale Stellschrauben in **`app.py`**:
+1. **Chunking** (`app.py`): strukturbewusst. Überschriften werden erkannt und
+   als Präfix in den Chunk übernommen, Seiten- und Foliengrenzen sind harte
+   Schnittpunkte, Inhaltsverzeichnis-Punktlinien und wiederkehrende Fusszeilen
+   fliegen raus. Zielgrösse ~500 Zeichen.
+2. **Metadaten-Tags**: per Regex erkannte Inhaltstypen (Frist, Schwellenwert,
+   Zuständigkeit) werden **getrennt vom Text** gespeichert und gelangen nie ins
+   Embedding-Fenster.
+3. **Embedding**: im Browser, `passage: `-Präfix für Chunks, `query: ` für
+   Suchanfragen. Beide Seiten müssen zum Trainingsschema des Modells passen.
+4. **Retrieval**: Reciprocal Rank Fusion aus Cosinus-Ähnlichkeit und BM25.
+   Strukturierte Operatoren wirken als harter Vorfilter davor.
 
-| Konstante       | Bedeutung                                         |
-|-----------------|---------------------------------------------------|
-| `CHUNK_TARGET`  | Ziel-Zeichen pro Chunk (Standard 500)             |
-| `CHUNK_HARD`    | harte Obergrenze pro Chunk (750)                  |
-| `TOP_K`         | Anzahl Treffer pro Suche (6)                      |
-| `RRF_K`         | RRF-Konstante (60)                                |
-| `HOST` / `PORT` | Bind-Adresse (`127.0.0.1:8000`)                   |
-
-In **`static/llm_worker.js`**: `PROMPT_BUDGET` (Zeichenbudget des Kontexts),
-Default-Modellname und `dtype`-Varianten. In **`static/embed_worker.js`**:
-`EMBED_MODEL`, `EXPECT_DIM`, E5-Präfixe.
-
-Die System-Prompts für Chat- vs. RAG-Modus stehen oben in **`index.html`**
-(`PROMPT_CHAT`, `PROMPT_RAG`).
+`TAG_BOOST` in `app.py` ist verdrahtet, steht aber auf `1.0` (= aus). Er wird
+erst scharfgeschaltet, wenn `eval_harness.py` den Effekt gegen reines BM25
+gemessen hat. Eine Zahl ohne Messung wäre Bauchgefühl.
 
 ---
 
-## Troubleshooting
+## Messen statt schätzen
 
-Edge-Konsole mit **F12** öffnen.
+```
+python eval_harness.py
+```
 
-- **`SecurityError` / origin `'null'`** → `index.html` wurde doppelgeklickt statt
-  über den Server geöffnet. Immer `python app.py` + `http://localhost:8000`.
-- **404 auf eine `.onnx`-Datei** → im `models\<modell>\onnx\` fehlt die
-  angeforderte dtype-Variante. Embedder: `model_quantized.onnx` (q8). LLM:
-  `model_q4f16.onnx` (GPU) bzw. `model_uint8.onnx` (CPU).
-- **Port belegt** → tiseR läuft vermutlich schon. Vorhandene Instanz im Browser
-  öffnen oder die alte `python.exe` im Task-Manager beenden.
-- **Embedder-Fehler beim Start** → Modellordner/-dateien prüfen (Pflicht: das
-  e5-large-Embedding-Modell).
-- **Antwort ist Kauderwelsch** → vermutlich ein Embedder als LLM ausgewählt; prüfen,
-  dass nur echte Sprachmodelle ohne Embedder-Namensmuster im Dropdown stehen.
+Misst Retrieval-Recall@5 gegen das Golden-Set in der Datei. **Nur Retrieval** —
+ob das LLM die gefundene Stelle korrekt wiedergibt, ist eine separate Frage.
 
+Zwei Fehlerklassen, die sich nicht verwechseln lassen dürfen:
 
+- **Retrieval-Fehler**: der richtige Chunk kommt gar nicht im Kontext an.
+  Kein grösseres LLM repariert das.
+- **Dekodier-Fehler**: der Chunk war da, die Antwort trotzdem falsch.
+  Beobachtet: „ISO 901" statt „9001", „1320" statt „>1320" — aus einer
+  Näherung wird eine falsche Präzision.
+
+`repetition_penalty` muss deshalb **exakt 1.0** bleiben. Jeder Wert darüber
+bestraft wiederholte Tokens — und Ziffern wiederholen sich in Zahlen.
+
+Im Browser-Log stehen pro Antwort Backend, dtype, TTFT und tok/s:
+
+```
+[tiseR] AKTIV: WEBGPU · q4f16 · LFM2.5-2.6B
+[tiseR] webgpu/q4f16 — TTFT 1.42 s · 18.30 tok/s · gesamt 9.6 s
+```
+
+Steht dort `wasm`, läuft das Modell auf der CPU — typisch Faktor 5–10 langsamer.
+Der Fallback ist absichtlich still, deshalb dieser Nachweis.
+
+---
+
+## Fehlersuche (Edge-Konsole mit F12)
+
+| Symptom | Ursache |
+|---|---|
+| `SecurityError … origin 'null'` | `index.html` doppelgeklickt statt Server benutzt |
+| 404 auf `config.json`, Embedder lädt ewig | Ordnername ≠ `EMBED_MODEL` in `embed_worker.js` |
+| `RangeError: Array buffer allocation failed` | Modell überschreitet den WASM-Heap |
+| `file was not found locally at "…onnx_data_2"` | External-Data-Shards unvollständig |
+| `Self-Test: Dim=0, erwartet 1024` | `tokenizer.json` oder `sentencepiece.bpe.model` fehlt |
+| GPU-Auslastung nur ~25 % | normal — autoregressives Decodieren ist bandbreiten-, nicht rechengebunden |
+
+---
+
+## Bekannte offene Punkte
+
+- **Umbenennung `armachat` → `tiseR` unvollständig.** Betroffen:
+  `setup_shortcut.py` (verweist noch auf `C:\armachat`), Datenbankname
+  `armachat.db`, Logdatei `armachat_error.log`, Logger-Name in `app.py`.
+- `requirements.txt` listet transitive Abhängigkeiten noch nicht vollständig
+  (`typing_extensions`, `colorama` traten beim Offline-Install auf).
+- `setup_shortcut.py` nutzt PowerShell mit COM — unter AppLocker blockiert.
+  Die Verknüpfung muss manuell erstellt werden (siehe Installation).
+- Verfügbarkeit von SQLite FTS5 im ausgelieferten Python-Build ist ungeprüft.
+- `eval_harness.py` braucht eine Prüfung numerischer Treue („1320" vs. „>1320")
+  und einheitliche Dekodierparameter, bevor Ergebnisse belastbar sind.
+
+---
+
+## Update der Dokumente
+
+Neue Dateien nach `data\` legen und „Ordner data\ einlesen" erneut ausführen.
+Für einen vollständigen Neuaufbau die `.db`-Datei löschen und neu einlesen.
+Die Modelle bleiben davon unberührt.
+
+Nach Änderungen am Chunking oder am Passage-Präfix ist eine Neuindexierung
+zwingend — die gespeicherten Vektoren passen sonst nicht mehr zum Code.
+Änderungen am **Query**-Präfix allein erfordern das nicht.
