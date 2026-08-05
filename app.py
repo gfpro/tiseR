@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-tiseR - RAG-Backend   [Version 20260702v01] (AppLocker-konform, KEINE nativen DLLs)
+tiseR - RAG-Backend   [Version 20260805v04] (AppLocker-konform, KEINE nativen DLLs)
 Optimierungen ggue. v1:
   1. Strukturbewusstes Chunking (Ueberschriften-Schnitte, ToC/Kopfzeilen entfernt,
      Ueberschrift als Praefix im Chunk).
@@ -44,7 +44,9 @@ HOST, PORT = "127.0.0.1", 8000
 CHUNK_TARGET = 500      # Ziel-Zeichen/Chunk: passt ins Embedding-Fenster (~128 Tokens)
 CHUNK_HARD   = 750      # harte Obergrenze
 CHUNK_MIN    = 15       # Mindestlaenge (sonst gehen kurze Folien beim Seiten-Flush verloren)
-TOP_K        = 4      # 3-5 Quellen reichen; gezielte Antwort steckt nicht in 6
+TOP_K        = 6      # 20260805v04: von 4 auf 6. Der Worker schnitt zusaetzlich auf
+                        # slice(0,3) -> effektiv sahen die Modelle 3 Chunks. Bei
+                        # 500-Zeichen-Chunks aus Mail-Korpora ist das zu wenig Substanz.
 RRF_K        = 60       # RRF-Konstante (Standardwert)
 PAGE_BREAK   = "\x0c"   # Seiten-/Foliengrenze -> harter Chunk-Schnitt
 # Metadaten-Boost: weicher, MULTIPLIKATIVER Faktor auf Chunks, deren Tags zum
@@ -237,12 +239,37 @@ def extract_csv_text(src) -> str:
         if line: out.append(line)
     return "\n".join(out)
 
+# --- MIME-encoded-words (RFC 2047) ----------------------------------------
+# In WEITERGELEITETEN Mails stehen die Header des Originals als TEXT im Body:
+#   "Von: =?utf-8?B?QnJlY2hiw7xobCBGYWJpYW4gQVJNQVNVSVNTRQ==?= <...>"
+# policy.default dekodiert nur die ECHTEN Header, nicht diese Textzeilen. Der
+# Base64-Salat landete also in Chunk UND Embedding: er frisst Kontextfenster,
+# zerstoert die Namens-Semantik und tauchte in den Testantworten woertlich auf.
+# Hier wird jedes encoded-word im gesamten extrahierten Text aufgeloest.
+_RX_MIME_WORD = re.compile(r'=\?([\w\-]+)\?([BbQq])\?([^?]*)\?=')
+
+def _decode_mime_words(text: str) -> str:
+    if not text or "=?" not in text:
+        return text
+    import base64, quopri
+    def _one(m):
+        charset, enc, payload = m.group(1), m.group(2).upper(), m.group(3)
+        try:
+            if enc == "B":
+                raw = base64.b64decode(payload + "=" * (-len(payload) % 4))
+            else:
+                raw = quopri.decodestring(payload.replace("_", " "))
+            return raw.decode(charset, "replace")
+        except Exception:
+            return m.group(0)          # unlesbar -> unveraendert stehen lassen
+    return _RX_MIME_WORD.sub(_one, text)
+
 def _sender_label(raw: str) -> str:
     """Lesbarer Absendername aus einem From-Header.
     'Brechbühl Fabian <f.b@vbs.admin.ch>' -> 'Brechbühl Fabian'.
     Fallback: lokaler Teil der Adresse."""
     if not raw: return ""
-    raw = raw.strip()
+    raw = _decode_mime_words(raw).strip()
     m = re.match(r'\s*"?([^"<]+?)"?\s*<[^>]+>\s*$', raw)
     if m:
         name = m.group(1).strip().strip('"\'')
@@ -274,7 +301,9 @@ def extract_eml_text(src) -> str:
     # auf den Absender aufloesbar (Koreferenz-Fix, z.B. "Ich bin der EPIC-Owner").
     sender_short = _sender_label(msg.get("From") or "")
     md_head = [f"## Mail von {sender_short}"] if sender_short else []
-    return "\n".join(md_head + head + ["", body.strip()])
+    # Ganzer Text durch den MIME-Dekoder: erwischt auch die als Body-Text
+    # eingebetteten Header weitergeleiteter Mails.
+    return _decode_mime_words("\n".join(md_head + head + ["", body.strip()]))
 
 # --------------------------------------------------------------- MSG (Outlook, binaeres OLE -> olefile, rein Python)
 try:
@@ -315,7 +344,7 @@ def extract_msg_text(src) -> str:
         if sender:  head.append("Von: " + sender)
         if recips:  head.append("An: " + ", ".join(dict.fromkeys(recips)))
         if subject: head.append("Betreff: " + subject)
-        return "\n".join(md_head + head + ["", body.strip()])
+        return _decode_mime_words("\n".join(md_head + head + ["", body.strip()]))
     finally:
         ole.close()
 

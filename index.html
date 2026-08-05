@@ -1,5 +1,5 @@
 <!doctype html>
-<!-- tiseR — index.html — 20260702v01 -->
+<!-- tiseR — index.html — 20260805v03 -->
 <html lang="de">
 <head>
 <meta charset="utf-8">
@@ -182,6 +182,9 @@
   .typing i{width:6px;height:6px;border-radius:50%;background:var(--muted2);animation:bounce 1.2s infinite;}
   .typing i:nth-child(2){animation-delay:.15s;} .typing i:nth-child(3){animation-delay:.3s;}
   @keyframes bounce{0%,60%,100%{transform:translateY(0);opacity:.4;}30%{transform:translateY(-5px);opacity:1;}}
+  .phase{font-family:var(--mono);font-size:10px;color:var(--muted2);
+    letter-spacing:.06em;white-space:nowrap;}
+  .phase.done{color:var(--accent);}
   details.src{margin-top:6px;}
   details.src summary{font-family:var(--mono);font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:var(--accent);cursor:pointer;list-style:none;padding:4px 0;}
   details.src summary::-webkit-details-marker{display:none;}
@@ -381,14 +384,15 @@ function makeWorker(url, onStatus){
     if(d.type==="error"&&!d.requestId){ready&&ready.rej(new Error(d.text));return;}
     if(d.requestId&&waiters.has(d.requestId)){
       const wt=waiters.get(d.requestId);
-      if(d.type==="token"){ wt.onToken&&wt.onToken(d.text); return; }   // Stream-Delta
+      if(d.type==="token"){ wt.h&&wt.h.onToken&&wt.h.onToken(d.text); return; }   // Stream-Delta
+      if(d.type==="phase"){ wt.h&&wt.h.onPhase&&wt.h.onPhase(d.phase); return; }   // Verstehen/Denken/Antworten
       if(d.type==="error"){waiters.delete(d.requestId);wt.rej(new Error(d.text));}
       else if(["done","embedded","query_embedded"].includes(d.type)){waiters.delete(d.requestId);wt.res(d);}
     }
   };
   return {
     load(p){return new Promise((res,rej)=>{ready={res,rej};w.postMessage({type:"load",...(p||{})});});},
-    call(msg,onToken){const requestId=Math.random().toString(36).slice(2);return new Promise((res,rej)=>{waiters.set(requestId,{res,rej,onToken});w.postMessage({...msg,requestId});});},
+    call(msg,h){const requestId=Math.random().toString(36).slice(2);return new Promise((res,rej)=>{waiters.set(requestId,{res,rej,h});w.postMessage({...msg,requestId});});},
     terminate(){w.terminate();}
   };
 }
@@ -609,26 +613,39 @@ async function ensureLLM(){
   }
 }
 let chatHistory=[];   // Kurzzeitgedaechtnis: [{role:'user'|'assistant', content}]
-// Token-Obergrenze: Zusammenfassungen/Listen brauchen mehr Platz. Faktenfragen
+// Token-Obergrenze. ACHTUNG bei Reasoning-Modellen (LFM2.5): der Denk-Trace
+// zaehlt VOLL gegen dieses Budget, bevor das erste sichtbare Zeichen entsteht.
+// 250 reichten dort nicht bis '</think>' -> die Antwort war leer/abgeschnitten.
+// Zusammenfassungen/Listen brauchen mehr Platz. Faktenfragen
 // (Frist, Schwellenwert, Zuständigkeit) sind nach wenigen Sätzen fertig — ein
 // niedriges Cap halbiert die Decode-Zeit der häufigsten Fragen. Greedy stoppt
 // bei kurzen Antworten ohnehin per EOS, lange Antworten nutzen das volle Budget.
 function maxTokensFor(q){
   const s=(q||"").toLowerCase();
-  if(/zusammenfass|\bfasse\b|überblick|uberblick|\bliste\b|\bauflist\w*\b|alle (stärken|schwächen|risiken|chancen|punkte|rollen)|worum geht|was steht/.test(s)) return 900;
-  return 250;
+  if(/zusammenfass|\bfasse\b|überblick|uberblick|\bliste\b|\bauflist\w*\b|alle (stärken|schwächen|risiken|chancen|punkte|rollen)|worum geht|was steht/.test(s)) return 1400;
+  return 650;
 }
 // Stream-Renderer: bei jedem Token wächst der Text in der Bubble. Beim Abschluss
 // (done.text) ersetzt der bereinigte Endtext den gestreamten Rohtext in einem
 // Zug — so flackern Markdown-/Special-Token-Reste nicht nach.
+const PHASE_LABEL={prefill:"Kontext lesen",thinking:"Denken",answering:"Antworten"};
 function makeStreamSink(bubble,msgEl){
-  let acc="";
+  let acc="", phase="prefill", t0=Date.now(), timer=null;
+  const el=document.createElement("span"); el.className="phase";
+  msgEl.querySelector(".msg-meta").appendChild(el);
+  const secs=()=>((Date.now()-t0)/1000).toFixed(1);
+  const paint=()=>{ el.textContent=PHASE_LABEL[phase]+" · "+secs()+" s"; };
+  paint(); timer=setInterval(paint,100);
   return {
+    // Der Worker haelt den Reasoning-Trace zurueck; hier kommt nur die Phase an.
+    onPhase(p){ phase=p; paint(); },
     onToken(delta){
       if(msgEl.classList.contains("empty")){ msgEl.classList.remove("empty"); bubble.textContent=""; }
       acc+=delta; bubble.textContent=acc;
       $("chat-wrap").scrollTop=$("chat-wrap").scrollHeight;
-    }
+    },
+    stop(){ if(timer)clearInterval(timer); timer=null;
+      el.classList.add("done"); el.textContent="fertig · "+secs()+" s"; }
   };
 }
 async function ask(){
@@ -646,22 +663,22 @@ async function ask(){
         m.classList.add("chatmode"); m.querySelector(".msg-name").textContent="tiseR · Chat";
         await ensureLLM();
         const sink=makeStreamSink(b,m);
-        const{text}=await llm.call({type:"generate",prompt:q,context:[],maxNewTokens:tok,systemPrompt:PROMPT_CHAT,history:chatHistory},sink.onToken);
-        m.classList.remove("empty"); b.textContent=text; answer=text;
+        const{text}=await llm.call({type:"generate",prompt:q,context:[],maxNewTokens:tok,systemPrompt:PROMPT_CHAT,history:chatHistory},sink);
+        sink.stop(); m.classList.remove("empty"); b.textContent=text; answer=text;
       } else {
         await ensureLLM();
         const sink=makeStreamSink(b,m);
         const ragHist=chatHistory.filter(h=>h.role==="user");   // Fix: keine Assistant-Antworten zurückfüttern (verhindert Namens-Recycling im RAG)
-        const{text}=await llm.call({type:"generate",prompt:q,context:hits.map(h=>({source:h.source,content:h.text})),maxNewTokens:tok,systemPrompt:PROMPT_RAG,history:ragHist},sink.onToken);
-        m.classList.remove("empty"); b.textContent=text; answer=text; addSources(m,hits);
+        const{text}=await llm.call({type:"generate",prompt:q,context:hits.map(h=>({source:h.source,content:h.text})),maxNewTokens:tok,systemPrompt:PROMPT_RAG,history:ragHist},sink);
+        sink.stop(); m.classList.remove("empty"); b.textContent=text; answer=text; addSources(m,hits);
       }
     } else {
       const{m,b}=addMsg(null,"bot","chatmode");
       setStatus("antworte…","busy"); bar(30);
       await ensureLLM();
       const sink=makeStreamSink(b,m);
-      const{text}=await llm.call({type:"generate",prompt:q,context:[],maxNewTokens:tok,systemPrompt:PROMPT_CHAT,history:chatHistory},sink.onToken);
-      m.classList.remove("empty"); b.textContent=text; answer=text;
+      const{text}=await llm.call({type:"generate",prompt:q,context:[],maxNewTokens:tok,systemPrompt:PROMPT_CHAT,history:chatHistory},sink);
+      sink.stop(); m.classList.remove("empty"); b.textContent=text; answer=text;
     }
     // Turn ins Gedaechtnis; auf die letzten 6 Nachrichten (3 Paare) begrenzen.
     if(answer){
