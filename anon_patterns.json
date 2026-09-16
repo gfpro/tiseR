@@ -1,0 +1,95 @@
+{
+  "version": "20260908v01",
+  "hinweis": "Nur STRUKTURMUSTER. Konkrete Begriffe (Namen, Projekte, Standorte) gehoeren NICHT hierher, sondern in das Blatt '_anon' der lokalen Glossar-XLSX unter eval\\. Diese Datei darf auf GitHub liegen, jene niemals.",
+  "muster": [
+    {
+      "name": "AHV-Nummer",
+      "regex": "\\b756[.\\s]?\\d{4}[.\\s]?\\d{4}[.\\s]?\\d{2}\\b",
+      "pruefung": "ean13",
+      "ersatz": "[AHV-NR]",
+      "beispiel": "756.9217.0769.85",
+      "aktiv": true
+    },
+    {
+      "name": "IBAN",
+      "regex": "\\b[A-Z]{2}\\d{2}(?:[ ]?[A-Z0-9]{4}){2,7}(?:[ ]?[A-Z0-9]{1,4})?\\b",
+      "pruefung": "iban",
+      "ersatz": "[IBAN]",
+      "beispiel": "CH9300762011623852957",
+      "aktiv": true
+    },
+    {
+      "name": "E-Mail-Adresse",
+      "regex": "\\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}\\b",
+      "pruefung": null,
+      "ersatz": "[MAIL]",
+      "beispiel": "hans.muster@bit.admin.ch",
+      "aktiv": true
+    },
+    {
+      "name": "Telefonnummer CH",
+      "regex": "(?:\\+41[ ]?|0)(?:\\d{2})[ ]?\\d{3}[ ]?\\d{2}[ ]?\\d{2}\\b",
+      "pruefung": null,
+      "ersatz": "[TELEFON]",
+      "beispiel": "+41 58 465 12 34",
+      "aktiv": true
+    },
+    {
+      "name": "Geburts-/Datumsangabe",
+      "regex": "\\b(?:0?[1-9]|[12]\\d|3[01])\\.(?:0?[1-9]|1[0-2])\\.(?:19|20)\\d{2}\\b",
+      "pruefung": null,
+      "ersatz": "[DATUM]",
+      "beispiel": "14.03.1978",
+      "aktiv": false,
+      "kommentar": "Standardmaessig AUS: Sitzungs- und Fristdaten sind meist unproblematisch und haeufig. Nur einschalten, wenn Geburtsdaten im Dokument erwartet werden."
+    },
+    {
+      "name": "Koordinaten LV95",
+      "regex": "\\b2[.']?[0-9]{3}[.']?[0-9]{3}(?:\\.\\d+)?[\\s,/]+1[.']?[0-9]{3}[.']?[0-9]{3}(?:\\.\\d+)?\\b",
+      "pruefung": "lv95",
+      "ersatz": "[KOORD-LV95]",
+      "beispiel": "2600000.0 1200000.0",
+      "aktiv": true
+    },
+    {
+      "name": "Koordinaten LV03",
+      "regex": "\\b[67][0-9]{2}[.']?[0-9]{3}(?:\\.\\d+)?[\\s,/]+[12][0-9]{2}[.']?[0-9]{3}(?:\\.\\d+)?\\b",
+      "pruefung": "lv03",
+      "ersatz": "[KOORD-LV03]",
+      "beispiel": "600'000 200'000",
+      "aktiv": true
+    },
+    {
+      "name": "Koordinaten WGS84",
+      "regex": "\\b4[5-7]\\.\\d{4,}\\s*[,;]\\s*[5-9]\\.\\d{4,}\\b",
+      "pruefung": null,
+      "ersatz": "[KOORD-WGS84]",
+      "beispiel": "46.94809, 7.44744",
+      "aktiv": true
+    },
+    {
+      "name": "Dokument-ID ar-D",
+      "regex": "\\bar-[A-Z]-[0-9A-F]{8}(?:/\\d+)?\\b",
+      "pruefung": null,
+      "ersatz": "[DOK-ID]",
+      "beispiel": "ar-D-3DD93401/1644",
+      "aktiv": true
+    },
+    {
+      "name": "Personalnummer",
+      "regex": "\\b(?:Pers(?:onal)?[-. ]?Nr\\.?|PN)[: ]+\\d{5,8}\\b",
+      "pruefung": null,
+      "ersatz": "[PERSONALNR]",
+      "beispiel": "Pers-Nr. 1234567",
+      "aktiv": true
+    },
+    {
+      "name": "Kreditorennummer / MWST-Nr",
+      "regex": "\\bCHE[- ]?\\d{3}[.\\s]?\\d{3}[.\\s]?\\d{3}\\b",
+      "pruefung": null,
+      "ersatz": "[UID]",
+      "beispiel": "CHE-123.456.789",
+      "aktiv": true
+    }
+  ]
+}

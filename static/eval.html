@@ -1,0 +1,222 @@
+<!doctype html>
+<!-- tiseR — eval.html — 20260904v01
+     Variante B: misst das ECHTE Hybrid-Retrieval (Cosine + BM25 -> RRF).
+     Die Seite tut nur zwei Dinge: Query-Vektor erzeugen (embed_worker.js) und
+     an /api/eval/step schicken. Suche und Bewertung laufen im Backend.
+     Ablegen unter:  C:\tiseR\static\eval.html   ->  http://localhost:8000/eval -->
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>tiseR · Eval</title>
+<style>
+ :root{--bg:#fff;--surface:#f9fafb;--border:#e5e7eb;--text:#111827;--muted:#6b7280;
+       --accent:#2563eb;--ok:#059669;--bad:#dc2626;--warn:#d97706;
+       --mono:ui-monospace,"Cascadia Code",Consolas,monospace;
+       --sans:ui-sans-serif,"Segoe UI",system-ui,sans-serif;}
+ *{box-sizing:border-box;margin:0;padding:0}
+ body{font-family:var(--sans);color:var(--text);background:var(--bg);padding:24px;line-height:1.5}
+ h1{font-size:19px;font-weight:700;letter-spacing:-.02em;margin-bottom:2px}
+ .sub{font-size:12px;color:var(--muted);margin-bottom:20px}
+ .panel{border:1px solid var(--border);border-radius:12px;padding:16px;margin-bottom:16px;background:var(--surface)}
+ .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
+ .row:last-child{margin-bottom:0}
+ label{font-family:var(--mono);font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+ select,input[type=text],input[type=number]{border:1px solid var(--border);border-radius:8px;padding:6px 10px;
+   font-family:var(--mono);font-size:12px;background:#fff;color:var(--text)}
+ button{border:0;border-radius:8px;background:var(--accent);color:#fff;cursor:pointer;
+   font-family:var(--mono);font-size:11px;letter-spacing:.04em;padding:8px 14px}
+ button.ghost{background:transparent;border:1px solid var(--border);color:var(--text)}
+ button:disabled{opacity:.45;cursor:default}
+ #bar{height:6px;background:var(--border);border-radius:99px;overflow:hidden;margin:10px 0 6px}
+ #bar>i{display:block;height:100%;width:0;background:var(--accent);transition:width .15s}
+ #log{font-family:var(--mono);font-size:11px;color:var(--muted);white-space:pre-wrap;
+   max-height:150px;overflow-y:auto;border-top:1px solid var(--border);padding-top:10px;margin-top:10px}
+ table{width:100%;border-collapse:collapse;font-size:12.5px}
+ th,td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--border)}
+ th{font-family:var(--mono);font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-weight:600}
+ td.num{font-family:var(--mono);text-align:right}
+ tr.total{font-weight:700;background:var(--surface)}
+ .g{color:var(--ok)} .r{color:var(--bad)} .y{color:var(--warn)}
+ .hint{font-size:11.5px;color:var(--muted);margin-top:10px;line-height:1.6}
+ .warnbox{border-left:3px solid var(--warn);padding:8px 12px;font-size:12px;color:#92400e;
+   background:#fffbeb;border-radius:0 8px 8px 0;margin-top:10px}
+</style>
+</head>
+<body>
+
+<h1>tiseR · Retrieval-Eval <span style="font-family:var(--mono);font-size:11px;color:var(--muted);font-weight:400">Variante B</span></h1>
+<div class="sub">Misst Cosine + BM25 + RRF auf dem Produktionspfad. Query-Embedding im Browser, Suche und Bewertung im Backend.</div>
+
+<div class="panel">
+  <div class="row">
+    <button id="loadBtn">Eval-Set laden</button>
+    <span id="setInfo" class="hint" style="margin:0"></span>
+  </div>
+  <div class="row">
+    <label for="sheet">Blatt</label>
+    <select id="sheet"><option value="">(alle)</option></select>
+    <label for="limit">Limit</label>
+    <input type="number" id="limit" value="0" min="0" step="10" style="width:80px">
+    <label for="k">Top-k</label>
+    <input type="number" id="k" value="6" min="1" max="20" style="width:60px">
+    <button id="runBtn" disabled>Lauf starten</button>
+    <button id="stopBtn" class="ghost" disabled>Stopp</button>
+  </div>
+  <div id="bar"><i></i></div>
+  <div class="row" style="justify-content:space-between">
+    <span id="prog" class="hint" style="margin:0">bereit</span>
+    <span id="live" class="hint" style="margin:0;font-family:var(--mono)"></span>
+  </div>
+  <div id="log"></div>
+</div>
+
+<div class="panel" id="resultPanel" style="display:none">
+  <div class="row">
+    <label for="label">Label</label>
+    <input type="text" id="label" placeholder="baseline" style="flex:1;min-width:160px">
+    <button id="saveBtn" class="ghost">Export speichern</button>
+    <button id="cmpBtn" class="ghost">Mit vorherigem vergleichen</button>
+  </div>
+  <div id="report"></div>
+</div>
+
+<script type="module">
+const $=id=>document.getElementById(id);
+const log=t=>{const l=$("log");l.textContent+=t+"\n";l.scrollTop=l.scrollHeight;};
+
+// ── Embedding-Worker: identisch zur Produktion, damit der Vektor derselbe ist ──
+const w=new Worker("/static/embed_worker.js");
+const waiters=new Map(); let ready=null;
+w.onmessage=e=>{
+  const d=e.data||{};
+  if(d.type==="status"){ $("prog").textContent=d.text; return; }
+  if(d.type==="ready"){ ready&&ready.res(); return; }
+  if(d.type==="error"&&!d.requestId){ ready&&ready.rej(new Error(d.text)); return; }
+  if(d.requestId&&waiters.has(d.requestId)){
+    const wt=waiters.get(d.requestId); waiters.delete(d.requestId);
+    d.type==="error"?wt.rej(new Error(d.text)):wt.res(d);
+  }
+};
+const embedLoad=()=>new Promise((res,rej)=>{ready={res,rej};w.postMessage({type:"load"});});
+const embedQuery=text=>{const requestId=Math.random().toString(36).slice(2);
+  return new Promise((res,rej)=>{waiters.set(requestId,{res,rej});
+    w.postMessage({type:"embed_query",text,requestId});});};
+
+let QUESTIONS=[], RUNNING=false, ABORT=false;
+
+$("loadBtn").addEventListener("click",async()=>{
+  $("loadBtn").disabled=true;
+  try{
+    const r=await(await fetch("/api/eval/load",{method:"POST",
+      headers:{"Content-Type":"application/json"},body:"{}"})).json();
+    if(r.error) throw new Error(r.error);
+    $("setInfo").innerHTML=`<b>${r.total}</b> Paare · ${r.sheets.length} Blätter · Index: <b>${r.indexed_chunks}</b> Chunks`;
+    const sel=$("sheet"); sel.innerHTML='<option value="">(alle)</option>';
+    r.sheets.forEach(s=>{const o=document.createElement("option");
+      o.value=s.sheet;o.textContent=`${s.sheet} (${s.n})`;sel.appendChild(o);});
+    if(!r.indexed_chunks) log("WARNUNG: Index ist leer — jeder Recall wäre 0.");
+    $("runBtn").disabled=false;
+    log(`Geladen: ${r.path}`);
+  }catch(e){ log("Fehler: "+e.message); }
+  $("loadBtn").disabled=false;
+});
+
+$("stopBtn").addEventListener("click",()=>{ABORT=true;log("Abbruch angefordert…");});
+
+$("runBtn").addEventListener("click",async()=>{
+  if(RUNNING) return;
+  RUNNING=true; ABORT=false;
+  $("runBtn").disabled=true; $("stopBtn").disabled=false; $("resultPanel").style.display="none";
+  const sheet=$("sheet").value, limit=+$("limit").value||0, k=+$("k").value||6;
+  try{
+    log("Embedding-Modell laden…"); await embedLoad(); log("Embedder bereit.");
+    const qs=new URLSearchParams(); if(sheet)qs.set("sheet",sheet); if(limit)qs.set("limit",limit);
+    const r=await(await fetch("/api/eval/questions?"+qs)).json();
+    if(r.error) throw new Error(r.error);
+    QUESTIONS=r.questions;
+    log(`${QUESTIONS.length} Fragen im Lauf.`);
+    let hits=0, done=0, t0=Date.now();
+    for(const q of QUESTIONS){
+      if(ABORT) break;
+      try{
+        const{vector}=await embedQuery(q.frage);
+        const res=await(await fetch("/api/eval/step",{method:"POST",
+          headers:{"Content-Type":"application/json"},
+          body:JSON.stringify({qid:q.qid,vector,k})})).json();
+        if(res.hit) hits++;
+      }catch(err){ log(`qid ${q.qid}: ${err.message}`); }
+      done++;
+      const pct=done/QUESTIONS.length*100;
+      $("bar").firstElementChild.style.width=pct+"%";
+      const rate=done/((Date.now()-t0)/1000);
+      const eta=Math.round((QUESTIONS.length-done)/(rate||1));
+      $("prog").textContent=`${done}/${QUESTIONS.length} · Rest ~${Math.floor(eta/60)}:${String(eta%60).padStart(2,"0")}`;
+      $("live").textContent=`Recall ${(hits/done*100).toFixed(1)} %`;
+    }
+    await showReport();
+    log(ABORT?"Abgebrochen — Teilergebnis ausgewertet.":"Lauf fertig.");
+  }catch(e){ log("Fehler: "+e.message); }
+  RUNNING=false; $("runBtn").disabled=false; $("stopBtn").disabled=true;
+});
+
+function cls(v){ return v>=.7?"g":v>=.4?"y":"r"; }
+const pct=v=>(v*100).toFixed(1)+" %";
+
+async function showReport(){
+  const r=await(await fetch("/api/eval/report")).json();
+  if(r.error){ log(r.error); return; }
+  let h=`<table><thead><tr><th>Blatt</th><th style="text-align:right">n</th>
+    <th style="text-align:right">Treffer</th><th style="text-align:right">Recall@k</th>
+    <th style="text-align:right">Coverage</th><th style="text-align:right">MRR</th></tr></thead><tbody>`;
+  h+=`<tr class="total"><td>GESAMT</td><td class="num">${r.overall.n}</td>
+      <td class="num">${r.overall.hits}</td>
+      <td class="num ${cls(r.overall.recall)}">${pct(r.overall.recall)}</td>
+      <td class="num">${pct(r.overall.coverage)}</td>
+      <td class="num">${r.overall.mrr.toFixed(3)}</td></tr>`;
+  for(const s of r.sheets.slice().sort((a,b)=>a.recall-b.recall)){
+    h+=`<tr><td>${s.sheet}</td><td class="num">${s.n}</td><td class="num">${s.hits}</td>
+        <td class="num ${cls(s.recall)}">${pct(s.recall)}</td>
+        <td class="num">${pct(s.coverage)}</td><td class="num">${s.mrr.toFixed(3)}</td></tr>`;
+  }
+  h+=`</tbody></table>
+   <div class="hint">Aufsteigend sortiert: <b>oben stehen die Blätter mit dem grössten Problem</b>.
+   Ein niedriger Wert bedeutet nicht zwingend schlechtes Retrieval — es kann auch heissen,
+   dass zu diesem Thema schlicht kein Dokument im Index liegt. Beides ist wertvoll zu wissen.</div>
+   <div class="warnbox">Die Bewertung ist eine gewichtete Term-Abdeckung, kein Ground Truth.
+   Sie misst zuverlässig <b>Veränderungen</b> zwischen zwei Läufen. Absolutwerte nicht überinterpretieren.</div>`;
+  $("report").innerHTML=h;
+  $("resultPanel").style.display="block";
+}
+
+$("saveBtn").addEventListener("click",async()=>{
+  const label=$("label").value.trim()||"run";
+  const r=await(await fetch("/api/eval/export",{method:"POST",
+    headers:{"Content-Type":"application/json"},body:JSON.stringify({label})})).json();
+  log(r.error?("Fehler: "+r.error):("Export: "+r.file));
+});
+
+$("cmpBtn").addEventListener("click",async()=>{
+  const r=await(await fetch("/api/eval/compare")).json();
+  if(r.error){ log(r.error); return; }
+  let h=`<table><thead><tr><th>Blatt</th><th style="text-align:right">n</th>
+    <th style="text-align:right">vorher</th><th style="text-align:right">nachher</th>
+    <th style="text-align:right">Δ</th></tr></thead><tbody>`;
+  const d=r.overall_after.recall-r.overall_before.recall;
+  h+=`<tr class="total"><td>GESAMT</td><td class="num">${r.overall_after.n}</td>
+      <td class="num">${pct(r.overall_before.recall)}</td>
+      <td class="num">${pct(r.overall_after.recall)}</td>
+      <td class="num ${d>0?"g":d<0?"r":""}">${d>=0?"+":""}${(d*100).toFixed(1)} pp</td></tr>`;
+  for(const s of r.sheets){
+    h+=`<tr><td>${s.sheet}</td><td class="num">${s.n}</td>
+        <td class="num">${pct(s.recall_before)}</td><td class="num">${pct(s.recall_after)}</td>
+        <td class="num ${s.delta>0?"g":s.delta<0?"r":""}">${s.delta>=0?"+":""}${(s.delta*100).toFixed(1)} pp</td></tr>`;
+  }
+  h+=`</tbody></table><div class="hint">${r.before} → ${r.after}. Aufsteigend nach Δ:
+      <b>oben stehen Verschlechterungen</b>. Eine Änderung, die im Gesamtwert gewinnt, aber
+      einzelne Blätter verschlechtert, ist ein Warnsignal — genau das verdeckt eine aggregierte Zahl.</div>`;
+  $("report").innerHTML=h;
+});
+</script>
+</body>
+</html>

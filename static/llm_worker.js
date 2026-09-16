@@ -1,5 +1,25 @@
 /**
- * tiseR — LLM-Worker   [Version 20260805v05]
+ * tiseR — LLM-Worker   [Version 20260810v01]
+ *
+ * NEU in 20260810v01 — SHARD-ERKENNUNG, STOP-TOKENS, PLAUSIBILITAET:
+ *  (I) STUB-SCHWELLE ABGESCHAFFT. probeVariant() entschied anhand von
+ *      STUB_THRESHOLD (1 MB), OB ueberhaupt nach .onnx_data-Shards gesucht wird.
+ *      Gemma4-Bund hat einen 2.4-MB-Graph-Stub -> ueber der Schwelle -> die
+ *      1.85 GB + 0.70 GB Shards wurden NIE gezaehlt. Ergebnis: "0.00 GB" in der
+ *      Konsole, Modell ohne Gewichte geladen, Decoder kopiert den Prompt statt
+ *      zu antworten. Jetzt wird IMMER nach Shards gesucht; ihre Existenz (nicht
+ *      die Stub-Groesse) entscheidet ueber External Data.
+ *  (J) PLAUSIBILITAETSPRUEFUNG. Ein Decoder unter MIN_DECODER_BYTES kann keine
+ *      Gewichte enthalten. Statt ihn zu laden und Prompt-Echo zu produzieren,
+ *      wird er mit klarer Begruendung abgelehnt. Fehlerhafte Exporte fallen
+ *      damit beim Laden auf, nicht erst im Benchmark.
+ *  (K) STOP-TOKENS AUS DEM TOKENIZER. Gemma 4 beendet Turns mit '<turn|>'
+ *      (eot_token, ID 106), NICHT mit '<eos>'. Ohne passende eos_token_id laeuft
+ *      der Decode bis max_new_tokens -> Timeout. eot_token/eos_token werden aus
+ *      der tokenizer_config gelesen und als eos_token_id durchgereicht.
+ *      Kein hardcodierter Modellname.
+ *  (L) CLEANUP kennt '<turn|>' und '<|turn>'.
+ *  (M) ALLOW_WASM_FALLBACK zurueck auf false (q2f16-Diagnose ist abgeschlossen).
  *
  * NEU in 20260805v04:
  *  (F) PROMPT_BUDGET 1800 -> 3000 und Kontext-Slice 3 -> 6. Das Backend lieferte
@@ -89,7 +109,7 @@ const DTYPE_WASM   = ['q4', 'uint8', 'q8', 'int8', 'q4f16', 'q2f16'];
 // Stiller WASM-Fallback: laedt bei einem WebGPU-Fehler das GESAMTE Modell noch
 // einmal und ueberdeckt dabei die urspruengliche Fehlermeldung.
 // Fuer die Fehlersuche auf false. Fuer den Produktivbetrieb ggf. wieder true.
-const ALLOW_WASM_FALLBACK = true;   // 20260805v05: TEMPORAER fuer den q2f16-CPU-Test. Danach zurueck auf false!
+const ALLOW_WASM_FALLBACK = false;  // 20260810v01: Diagnose beendet -> echte Fehler sichtbar lassen.
 
 // DIAGNOSE: WebGPU erzwungen deaktivieren, um WebGPU-vs-CPU zu isolieren.
 // true = laeuft auf WASM/CPU (langsam!), false = normal (WebGPU wenn verfuegbar).
@@ -97,15 +117,21 @@ const FORCE_WASM = false;
 
 // --- Groessengrenzen (Bytes) ----------------------------------------------
 const HEAP_LIMIT     = 4 * 1024 * 1024 * 1024;      // 32-Bit-WASM-Adressraum
-const TOTAL_BUDGET   = 3.4 * 1024 * 1024 * 1024;    // Reserve fuer KV-Cache/Runtime
-const STUB_THRESHOLD = 1 * 1024 * 1024;             // < 1 MB => External-Data-Stub
-const MAX_SHARDS     = 64;                           // Schutz gegen Endlosschleife
+const TOTAL_BUDGET   = 5.5 * 1024 * 1024 * 1024;    // Reserve fuer KV-Cache/Runtime
+const MAX_SHARDS     = 64;                          // Schutz gegen Endlosschleife
+// Plausibilitaet: ein Decoder-Graph ohne Gewichte ist wenige MB gross. Alles
+// unterhalb dieser Grenze KANN kein lauffaehiges Sprachmodell sein — laden wuerde
+// nur Prompt-Echo erzeugen. Bewusst grosszuegig: selbst ein 0.5B-Modell in q4
+// liegt deutlich darueber.
+const MIN_DECODER_BYTES = 100 * 1024 * 1024;        // 100 MB
 
 let generator = null, loading = false, generating = false;
 // Wird beim Laden aus dem Chat-Template abgeleitet (siehe loadModel).
 let THINKING = false;
 const THINK_CLOSE = '</think>';
 let ACTIVE_DEVICE = null, ACTIVE_DTYPE = null;
+let STOP_IDS = null;        // aus dem Tokenizer abgeleitete eos_token_id-Liste
+let STOP_STRINGS = [];      // dieselben Marker als Text, fuer den Cleanup
 let GPU_LIMITS = null;
 const queue = [];
 
@@ -183,24 +209,24 @@ async function probeVariant(prefix, dt) {
   const stub = await probeSize(base + '.onnx');
   if (stub < 0) return { ok: false, reason: prefix + dt + '.onnx fehlt' };
 
-  // Selbstenthalten: Gewichte stecken in der .onnx selbst.
-  if (stub >= STUB_THRESHOLD) return { ok: true, total: stub, largest: stub, shards: 1 };
-
-  // External Data: .onnx ist nur der Graph-Stub.
+  // IMMER nach External-Data-Shards suchen. Frueher entschied die Stub-Groesse
+  // darueber, ob ueberhaupt gesucht wird — ein 2.4-MB-Stub galt damit faelsch-
+  // licherweise als selbstenthalten und seine GB-Shards wurden ignoriert.
+  // Die Existenz von '.onnx_data' ist das einzige verlaessliche Kriterium.
+  let total = stub, largest = stub, shards = 1, external = false;
   const first = await probeSize(base + '.onnx_data');
-  if (first < 0) {
-    return { ok: false, reason: prefix + dt + '.onnx ist nur ein ' +
-      Math.round(stub / 1024) + '-kB-Graph-Stub, aber ' + prefix + dt +
-      '.onnx_data fehlt (External-Data-Shards nicht heruntergeladen)' };
+  if (first >= 0) {
+    external = true;
+    total += first; shards++;
+    if (first > largest) largest = first;
+    for (let i = 1; i < MAX_SHARDS; i++) {
+      const sz = await probeSize(base + '.onnx_data_' + i);
+      if (sz < 0) break;                     // erste Luecke = Ende der Kette
+      total += sz; shards++;
+      if (sz > largest) largest = sz;
+    }
   }
-  let total = stub + first, largest = first, shards = 1;
-  for (let i = 1; i < MAX_SHARDS; i++) {
-    const s = await probeSize(base + '.onnx_data_' + i);
-    if (s < 0) break;                        // erste Luecke = Ende der Kette
-    total += s; shards++;
-    if (s > largest) largest = s;
-  }
-  return { ok: true, total, largest, shards };
+  return { ok: true, total, largest, shards, external, stub };
 }
 
 /** Waehlt fuer EINEN Praefix den besten vollstaendigen, ins Budget passenden dtype.
@@ -210,6 +236,18 @@ async function pickDtype(prefix, device, budgetLeft, rejected) {
   for (const dt of list) {
     const v = await probeVariant(prefix, dt);
     if (!v.ok) { rejected.push(v.reason); continue; }
+    // Plausibilitaet: ein Decoder ohne Gewichte laedt zwar, antwortet aber nur
+    // mit einer Kopie des Prompts. Lieber hier hart ablehnen.
+    if (prefix.indexOf('decoder') >= 0 || prefix === 'model_') {
+      if (v.total < MIN_DECODER_BYTES) {
+        rejected.push(prefix + dt + ': nur ' + fmtGB(v.total) + ' gesamt' +
+          (v.external ? ' (' + v.shards + ' Datei(en))'
+                      : ' und KEINE .onnx_data-Shards daneben') +
+          ' — das ist ein Graph ohne Gewichte. Ein solches Modell laedt, ' +
+          'kopiert aber nur den Prompt. Export unvollstaendig.');
+        continue;
+      }
+    }
     if (v.total > budgetLeft) {
       rejected.push(prefix + dt + ': ' + fmtGB(v.total) + ' ueberschreitet das ' +
         'verbleibende Budget von ' + fmtGB(budgetLeft) +
@@ -355,6 +393,38 @@ async function loadModel() {
     } catch (_) { THINKING = false; }
     console.log('[tiseR] Reasoning-Modell (Template enthaelt <think>): ' + THINKING);
 
+    // Stop-Tokens AUS DEM TOKENIZER, nicht aus einer Modellnamen-Tabelle.
+    // Gemma 4 schliesst jeden Turn mit eot_token '<turn|>' (ID 106); '<eos>'
+    // erscheint dort nie. Fehlt diese ID in eos_token_id, laeuft der Decode bis
+    // max_new_tokens durch -> Timeout statt Antwort.
+    try {
+      const tk  = generator.tokenizer || {};
+      const cfg = tk._tokenizer_config || {};
+      const names = [];
+      for (const key of ['eot_token', 'eos_token']) {
+        let v = cfg[key];
+        if (v && typeof v === 'object') v = v.content;
+        if (typeof v === 'string' && v && names.indexOf(v) < 0) names.push(v);
+      }
+      const msst = cfg.model_specific_special_tokens || {};
+      if (typeof msst.eot_token === 'string' && names.indexOf(msst.eot_token) < 0)
+        names.push(msst.eot_token);
+      STOP_STRINGS = names.slice();
+      const ids = [];
+      for (const n of names) {
+        let id = null;
+        try { id = tk.convert_tokens_to_ids ? tk.convert_tokens_to_ids([n])[0] : null; }
+        catch (_) { id = null; }
+        if (typeof id === 'number' && id >= 0 && ids.indexOf(id) < 0) ids.push(id);
+      }
+      STOP_IDS = ids.length ? ids : null;
+      console.log('[tiseR] Stop-Tokens: ' + (names.join(' ') || '(keine)') +
+                  ' -> IDs ' + (STOP_IDS ? STOP_IDS.join(',') : '(aus generation_config)'));
+      if (!STOP_IDS) console.warn('[tiseR] Keine Stop-Token-IDs ableitbar — es gilt ' +
+        'allein die eos_token_id aus generation_config.json. Fehlt die Datei, ' +
+        'laeuft jeder Decode bis max_new_tokens.');
+    } catch (_) { STOP_IDS = null; STOP_STRINGS = []; }
+
     loading = false;
 
     // Harter Nachweis: unabhaengig von Status-Updates, unuebersehbar in der Konsole.
@@ -406,6 +476,18 @@ async function generate(job) {
 
     self.postMessage({ type: 'phase', phase: 'prefill', requestId });
 
+    // DIAGNOSE: der tatsaechlich gesendete Prompt-String. Zeigt sofort, ob das
+    // Chat-Template greift (<|turn>user ... <|turn>model) und ob der Prompt mit
+    // der AKTUELLEN Frage endet. Ohne diese Zeile ist jede Fehlersuche Raten.
+    try {
+      const dbg = generator.tokenizer.apply_chat_template(messages, {
+        tokenize: false, add_generation_prompt: true });
+      console.log('[tiseR] PROMPT (' + dbg.length + ' Zeichen) >>>\n' +
+                  JSON.stringify(dbg.slice(0, 400)) + '\n   ... ENDE >>>\n' +
+                  JSON.stringify(dbg.slice(-260)));
+      console.log('[tiseR] messages-Rollen:', messages.map(m => m.role).join(' | '));
+    } catch (e) { console.warn('[tiseR] Prompt-Log fehlgeschlagen:', e.message); }
+
     // Token-Streaming mit Reasoning-Filter.
     // Bei THINKING wird ALLES vor dem ersten '</think>' zurueckgehalten und nie
     // gepostet — die Bubble bleibt im "Denken"-Zustand, bis die eigentliche
@@ -444,16 +526,30 @@ async function generate(job) {
     const timeoutMs = Math.max(180000, tokenLimit * 400 + 30000);
     const genOpts = {
       max_new_tokens: tokenLimit, do_sample: false,      // greedy = faktentreuer
-      repetition_penalty: 1.0,
+      repetition_penalty: 1.0,                           // >1.0 verschluckt Ziffern
     };
+    // Abgeleitete Stop-Tokens ergaenzen die generation_config. Ohne sie endet
+    // ein Gemma-4-Turn nie (er schliesst mit '<turn|>', nicht mit '<eos>').
+    if (STOP_IDS && STOP_IDS.length) genOpts.eos_token_id = STOP_IDS;
     if (streamer) genOpts.streamer = streamer;
     const result = await withTimeout(generator(messages, genOpts), timeoutMs);
 
     // Antwort extrahieren (Chat-Template -> letzter assistant-Turn)
     let output = result[0] && result[0].generated_text, answer = '';
     if (Array.isArray(output)) {
-      const m = output.filter(x => x.role === 'assistant').pop();
-      answer = m ? (m.content || '') : (output[output.length - 1]?.content || '');
+      // NUR die neu erzeugten Turns betrachten. Die alte Fassung filterte ueber
+      // den GESAMTEN zurueckgegebenen Verlauf (Eingabe + Ausgabe) und griff bei
+      // leerer Generierung auf output[last] zurueck — das ist die EINGABE, also
+      // die eigene Frage bzw. der Dokumentenblock. Genau daher kamen die
+      // "Antworten", die den vorherigen Prompt wiederholten.
+      const fresh = output.slice(messages.length);
+      const m = fresh.filter(x => x.role === 'assistant').pop();
+      answer = m ? (m.content || '') : '';
+      if (!answer && fresh.length === 0) {
+        console.warn('[tiseR] Modell hat keinen neuen Turn erzeugt ' +
+                     '(Eingabe: ' + messages.length + ' Nachrichten, ' +
+                     'Rueckgabe: ' + output.length + ').');
+      }
     } else { answer = String(output || ''); }
 
     // Bereinigung. ZUERST der Reasoning-Schnitt: der oeffnende <think>-Tag steht
@@ -468,7 +564,12 @@ async function generate(job) {
       answer = '';
     }
     answer = answer.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
-    answer = answer.split('<|im_end|>')[0].split('</s>')[0].split('<end_of_turn>')[0].trim();
+    // Turn-Marker abschneiden. '<turn|>' (Gemma 4) kam bisher nicht vor —
+    // steht er im Text, folgt dahinter der halluzinierte naechste Turn.
+    const CUTS = ['<|im_end|>', '</s>', '<end_of_turn>', '<turn|>', '<|turn>', '<eos>']
+                 .concat(STOP_STRINGS);
+    for (const c of CUTS) { const i = answer.indexOf(c); if (i >= 0) answer = answer.slice(0, i); }
+    answer = answer.trim();
     answer = answer.replace(/\*\*([^*]+)\*\*/g, '$1').replace(/^#{1,4}\s+/gm, '').trim();
 
     const noInfo = /\s*[-–•]?\s*(?:dazu\s+)?enthalten\s+die\s+dokumente\s+keine\s+(?:konkrete\s+)?angabe[.…]*\s*$/i;

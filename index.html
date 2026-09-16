@@ -1,5 +1,7 @@
 <!doctype html>
-<!-- tiseR — index.html — 20260805v03 -->
+<!-- tiseR — index.html — 20260908v01
+     NEU ggue. 20260805v03: Query-Rewriting vor dem Retrieval (Feature-Flag,
+     per Default AUS). Siehe Block "Query-Rewriting" weiter unten. -->
 <html lang="de">
 <head>
 <meta charset="utf-8">
@@ -274,6 +276,21 @@
     </svg>
     <span class="badge hidden" id="badge">0</span>
   </button>
+
+  <!-- Werkzeuge in eigenen Tabs. Bewusst window.open statt Inline-Panel: beide
+       Seiten laden eigene Worker; ein Tab-Wechsel laesst den laufenden Chat
+       unberuehrt. Der Modell-Ladevorgang in /anon ist davon getrennt. -->
+  <button class="sb-btn" id="anonBtn" title="Anonymisierung">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M12 3l7 3v6c0 4-3 7-7 8-4-1-7-4-7-8V6z"/><circle cx="12" cy="11" r="2"/>
+    </svg>
+  </button>
+
+  <button class="sb-btn" id="evalBtn" title="Eval · Retrieval messen">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M4 5.5A2.5 2.5 0 016.5 3H19v15H6.5A2.5 2.5 0 004 20.5z"/><path d="M9 8h6"/><path d="M9 12h4"/>
+    </svg>
+  </button>
 </aside>
 
 <!-- Main -->
@@ -314,6 +331,16 @@
             <button class="dp-btn ghost" id="folderBtn">Ordner data\ einlesen</button>
             <button class="dp-btn danger" id="resetBtn">Alle löschen</button>
             <span class="fmt-hint">PDF · DOCX · XLSX · PPTX · CSV · TXT · EML · MSG</span>
+          </div>
+          <div class="dm-section-label" style="margin-top:14px">Glossar</div>
+          <div class="up-row">
+            <input type="file" id="glossFiles" accept=".xlsx" multiple>
+            <button class="dp-btn" id="glossBtn">Glossar laden</button>
+          </div>
+          <div class="up-row">
+            <span class="fmt-hint">XLSX mit Kopfzeile Frage | Antwort | Thema | Quelle.
+            Wird nach eval\ abgelegt, je Zeile ein Chunk. Erneutes Laden ersetzt die alte
+            Fassung. Blätter mit _ am Anfang bleiben Messdaten und gehen nicht in den Index.</span>
           </div>
           <div class="dm-foot">
             <div id="doc-report"></div>
@@ -367,6 +394,10 @@
 // ── Prompts ──────────────────────────────────────────────────────────────────
 const PROMPT_RAG  = "Du bist ein präziser RAG-Assistent. Antworte auf Deutsch, nur auf Basis der bereitgestellten Dokumente. Antworte so knapp wie möglich — bei Faktenfragen genügen ein bis drei Sätze, keine Einleitung, keine Wiederholung der Frage. Du darfst Informationen aus mehreren Stellen kombinieren. Enthalten die Dokumente keine Grundlage für die Antwort, sage das offen (z. B. 'Dazu enthalten die Dokumente keine Angabe'). Erfinde keine Fakten.";
 const PROMPT_CHAT = "Du bist ein klarer, präziser Berater. Antworte auf Deutsch. Formuliere direkt, ohne Füllwörter. Wenn du etwas nicht weisst, sage es offen.";
+// Bewusst minimal. Je mehr Anweisungen, desto eher baut ein 2.6B-Modell eine
+// Präambel ("Hier ist die umgeschriebene Frage:") — die Plausibilitätsprüfung
+// verwirft solche Ausgaben, aber der Prefill ist dann trotzdem bezahlt.
+const PROMPT_REWRITE = "Du schreibst Suchanfragen um. Gib AUSSCHLIESSLICH die umgeschriebene Frage aus — keine Erklärung, keine Anführungszeichen, keine Einleitung, eine einzige Zeile auf Deutsch.";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 const $ = id => document.getElementById(id);
@@ -468,6 +499,8 @@ function toggleDocPanel(){
   $("doc-overlay").classList.contains("open") ? closeDocModal() : openDocModal();
 }
 $("docBtn").addEventListener("click",toggleDocPanel);
+$("anonBtn").addEventListener("click",()=>window.open("/anon","_blank"));
+$("evalBtn").addEventListener("click",()=>window.open("/eval","_blank"));
 $("plusBtn").addEventListener("click",toggleDocPanel);
 $("dmClose").addEventListener("click",closeDocModal);
 $("doc-overlay").addEventListener("click",e=>{ if(e.target===$("doc-overlay")) closeDocModal(); });
@@ -534,6 +567,27 @@ $("ingestBtn").addEventListener("click",async()=>{
           $("doc-report").className="";$("doc-report").textContent=`Fertig: ${n} Chunks indiziert.`; }
   }catch(e){$("doc-report").className="err";$("doc-report").textContent="Fehler: "+e.message;}
   $("ingestBtn").disabled=false; inp.value=""; renderDocs(); refresh();
+});
+
+$("glossBtn").addEventListener("click",async()=>{
+  const inp=$("glossFiles"); if(!inp.files.length)return;
+  $("glossBtn").disabled=true; $("doc-report").className=""; 
+  $("doc-report").textContent="Lese Glossar…"; setStatus("Glossar wird gelesen…","busy"); bar(5);
+  try{
+    const fd=new FormData(); for(const f of inp.files)fd.append("files",f);
+    const res=await(await fetch("/api/ingest_glossary",{method:"POST",body:fd})).json();
+    if(res.error){$("doc-report").className="err";$("doc-report").textContent="Fehler: "+res.error;}
+    else{
+      const n=await embedAndStore(res.pending||[]);
+      // Hinweise (keine Glossarzeilen, falsches Format) sichtbar machen statt still schlucken
+      const warn=(res.report||[]).filter(x=>!x.status.startsWith("OK"));
+      $("doc-report").className = warn.length ? "err" : "";
+      $("doc-report").textContent = warn.length
+        ? warn.map(x=>`${x.file}: ${x.status}`).join(" · ")
+        : `Glossar indiziert: ${n} Chunks, abgelegt in eval\\.`;
+    }
+  }catch(e){$("doc-report").className="err";$("doc-report").textContent="Fehler: "+e.message;}
+  $("glossBtn").disabled=false; inp.value=""; renderDocs(); refresh();
 });
 
 $("folderBtn").addEventListener("click",async()=>{
@@ -648,6 +702,76 @@ function makeStreamSink(bubble,msgEl){
       el.classList.add("done"); el.textContent="fertig · "+secs()+" s"; }
   };
 }
+// ── Query-Rewriting (Agent-Schritt 2) ────────────────────────────────────────
+// PROBLEM: Eine Folgefrage wie "Und wer meldet das?" enthaelt keinen einzigen
+// tragenden Begriff. embed_worker.js bildet daraus einen semantisch leeren
+// Vektor, BM25 in hybrid_search sucht nach "und/wer/meldet/das". Das Thema der
+// vorherigen Frage (z.B. "MAA-Betriebspruefung") steht NIRGENDS im Suchtext.
+// Ergebnis: Zufallstreffer oder "keine Angabe", obwohl die Antwort indiziert ist.
+//
+// LOESUNG: Ein zusaetzlicher, kurzer LLM-Aufruf VOR dem Retrieval loest Pronomen
+// und Auslassungen auf. Nur die SUCHE bekommt den umgeschriebenen Text — die
+// Generierung erhaelt weiterhin die Originalfrage, damit die Antwort auf das
+// antwortet, was der Nutzer tatsaechlich getippt hat.
+//
+// PREIS: ein zusaetzlicher Prefill-Durchlauf (grob 1-3 s) vor Folgefragen.
+// Erste Frage eines Gespraechs: uebersprungen, dort gibt es nichts aufzuloesen.
+//
+// SCHARFSCHALTUNG: AGENT_REWRITE bleibt false (Messmodus, gleiche Disziplin wie
+// GarbageCheck/TAG_BOOST). Bei false wird NICHTS umgeschrieben und NICHTS
+// zusaetzlich geladen. Zum Kalibrieren auf true setzen, zwanzig Folgefragen
+// durchspielen und die '[tiseR] Rewrite:'-Zeilen in der F12-Konsole pruefen.
+const AGENT_REWRITE   = false;
+// Laengere Folgefragen sind meist schon eigenstaendig formuliert -> der
+// Zusatz-Prefill waere verschenkt. 60 ist ein GESCHAETZTER Startwert, kein
+// Messergebnis. Beim Kalibrieren mitbeobachten.
+const REWRITE_MAX_LEN = 60;
+const REWRITE_TOKENS  = 80;
+
+/** Plausibilitaetspruefung. Ein 2.6B-Modell liefert bei dieser Aufgabe
+ *  gelegentlich Praeambeln, Mehrzeiler oder halluzinierte Zusaetze. Lieber kein
+ *  Rewriting als ein kaputtes: im Zweifel Originalfrage. */
+function _rewritePlausible(raw, orig){
+  let t=(raw||"").trim();
+  if(!t) return null;
+  if(t.startsWith("(")) return null;                 // Worker-Fallback "(leere Antwort)"
+  if(/[\r\n]/.test(t)) return null;                  // Mehrzeiler = Praeambel/Erklaerung
+  t=t.replace(/^["'«»\s]+|["'«»\s]+$/g,"").trim();   // Anfuehrungszeichen abstreifen
+  if(!t) return null;
+  if(t.length > orig.length*3 + 40) return null;     // ausgeufert
+  if(t.length < 8) return null;                      // zu kurz, um Kontext zu tragen
+  if(t.toLowerCase()===orig.toLowerCase()) return null;  // keine Aenderung -> nichts gewonnen
+  return t;
+}
+
+/** Liefert den Text, der ins RETRIEVAL geht. Faellt bei jedem Zweifel
+ *  stillschweigend auf die Originalfrage zurueck. */
+async function rewriteQuery(q){
+  if(!AGENT_REWRITE) return q;
+  if(!chatHistory.length) return q;                  // erste Frage: nichts aufzuloesen
+  if(q.length > REWRITE_MAX_LEN) return q;           // vermutlich schon eigenstaendig
+  const prev=chatHistory.filter(h=>h.role==="user").slice(-1)[0];
+  if(!prev) return q;
+  try{
+    await ensureLLM();
+    setStatus("Frage wird präzisiert…","busy");
+    const prompt="Vorherige Frage: "+String(prev.content).slice(0,300)+
+                 "\nNeue Frage: "+q+
+                 "\n\nSchreibe die neue Frage so um, dass sie ohne die vorherige verständlich ist.";
+    // Kein Streaming-Sink: die Tokens dieses Aufrufs duerfen nie in eine Bubble.
+    const{text}=await llm.call({type:"generate",prompt,context:[],
+                                maxNewTokens:REWRITE_TOKENS,
+                                systemPrompt:PROMPT_REWRITE,history:[]});
+    const cand=_rewritePlausible(text,q);
+    console.log("[tiseR] Rewrite: "+JSON.stringify(q)+" -> "+JSON.stringify(text||"")+
+                (cand?"   [uebernommen]":"   [VERWORFEN -> Originalfrage]"));
+    return cand || q;
+  }catch(e){
+    console.warn("[tiseR] Rewrite fehlgeschlagen, nutze Originalfrage:",e.message);
+    return q;
+  }
+}
+
 async function ask(){
   const ta=$("q"); const q=ta.value.trim(); if(!q)return;
   ta.value=""; ta.style.height="auto"; $("askBtn").disabled=true; addMsg(q,"user");
@@ -656,9 +780,12 @@ async function ask(){
   try{
     if(embeddedCount>0){
       const{m,b}=addMsg(null,"bot");
+      // Nur der SUCHTEXT wird ggf. umgeschrieben. 'q' (die Originalfrage) geht
+      // unveraendert an das LLM — die Antwort soll auf das Getippte antworten.
+      const qs=await rewriteQuery(q);
       setStatus("suche…","busy"); bar(20);
-      const{vector}=await embed.call({type:"embed_query",text:q});
-      const{hits}=await(await fetch("/api/search",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({vector,query:q})})).json();
+      const{vector}=await embed.call({type:"embed_query",text:qs});
+      const{hits}=await(await fetch("/api/search",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({vector,query:qs})})).json();
       if(!hits?.length){
         m.classList.add("chatmode"); m.querySelector(".msg-name").textContent="tiseR · Chat";
         await ensureLLM();

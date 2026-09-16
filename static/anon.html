@@ -1,0 +1,414 @@
+<!doctype html>
+<!-- tiseR - anon.html - 20260908v03
+     Datei hochladen, schuetzenswerte Stellen MARKIEREN, nach Freigabe ersetzen.
+     Musterfunde kommen aus dem Backend (deterministisch), LLM-Funde aus
+     llm_worker.js (Vorschlag, muss bestaetigt werden).
+     Ablegen unter:  C:\tiseR\static\anon.html  ->  http://localhost:8000/anon -->
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>tiseR · Anonymisierung</title>
+<style>
+ :root{--bg:#fff;--surface:#f9fafb;--border:#e5e7eb;--text:#111827;--muted:#6b7280;
+       --accent:#2563eb;--ok:#059669;--bad:#dc2626;--warn:#d97706;
+       --mono:ui-monospace,"Cascadia Code",Consolas,monospace;
+       --sans:ui-sans-serif,"Segoe UI",system-ui,sans-serif;}
+ *{box-sizing:border-box;margin:0;padding:0}
+ body{font-family:var(--sans);color:var(--text);background:var(--bg);padding:24px;line-height:1.5}
+ h1{font-size:19px;font-weight:700;letter-spacing:-.02em;margin-bottom:2px}
+ .sub{font-size:12px;color:var(--muted);margin-bottom:16px}
+ .panel{border:1px solid var(--border);border-radius:12px;padding:16px;margin-bottom:16px;background:var(--surface)}
+ .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
+ .row:last-child{margin-bottom:0}
+ label{font-family:var(--mono);font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+ select,input[type=file]{border:1px solid var(--border);border-radius:8px;padding:6px 10px;
+   font-family:var(--mono);font-size:12px;background:#fff;color:var(--text)}
+ button{border:0;border-radius:8px;background:var(--accent);color:#fff;cursor:pointer;
+   font-family:var(--mono);font-size:11px;letter-spacing:.04em;padding:8px 14px}
+ button.ghost{background:transparent;border:1px solid var(--border);color:var(--text)}
+ button:disabled{opacity:.45;cursor:default}
+ .hint{font-size:11.5px;color:var(--muted);line-height:1.6}
+ .warnbox{border-left:3px solid var(--warn);padding:8px 12px;font-size:12px;color:#92400e;
+   background:#fffbeb;border-radius:0 8px 8px 0;margin-bottom:12px}
+ .dangerbox{border-left:3px solid var(--bad);padding:10px 12px;font-size:12px;color:#7f1d1d;
+   background:#fef2f2;border-radius:0 8px 8px 0;margin-bottom:16px}
+ #bar{height:6px;background:var(--border);border-radius:99px;overflow:hidden;margin:10px 0 6px}
+ #bar>i{display:block;height:100%;width:0;background:var(--accent);transition:width .15s}
+ .cols{display:grid;grid-template-columns:minmax(0,1fr) 340px;gap:16px;align-items:start}
+ #view{border:1px solid var(--border);border-radius:12px;padding:14px;background:#fff;
+   font-family:var(--mono);font-size:12px;white-space:pre-wrap;word-break:break-word;
+   max-height:62vh;overflow-y:auto}
+ mark{border-radius:3px;padding:0 2px}
+ mark.m{background:#dbeafe;color:#1e3a8a;border-bottom:2px solid #2563eb}
+ mark.l{background:#ffedd5;color:#7c2d12;border-bottom:2px solid #ea580c}
+ mark.h{background:#dcfce7;color:#14532d;border-bottom:2px solid #059669}
+ mark.off{background:transparent;color:inherit;border-bottom:1px dotted var(--muted);opacity:.55}
+ #list{max-height:62vh;overflow-y:auto;border:1px solid var(--border);border-radius:12px;background:#fff}
+ .hit{display:flex;gap:8px;align-items:flex-start;padding:7px 10px;border-bottom:1px solid var(--border);font-size:12px}
+ .hit:last-child{border-bottom:0}
+ .hit input{margin-top:3px;flex:0 0 auto}
+ .hit .t{font-family:var(--mono);word-break:break-all}
+ .hit .s{display:block;font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em}
+ .hit.llm .s{color:#c2410c}
+ .hit.man .s{color:#047857}
+ .badge{font-family:var(--mono);font-size:10px;padding:1px 6px;border-radius:99px;border:1px solid var(--border);color:var(--muted)}
+ textarea{width:100%;min-height:180px;border:1px solid var(--border);border-radius:8px;padding:10px;
+   font-family:var(--mono);font-size:12px;background:#fff;color:var(--text)}
+</style>
+</head>
+<body>
+
+<h1>tiseR · Anonymisierung</h1>
+<div class="sub">Markiert schuetzenswerte Stellen. Ersetzt wird erst nach Freigabe. Version 20260908v03</div>
+
+<div class="dangerbox">
+  <b>Dieses Werkzeug ersetzt keine Klassifizierungspruefung.</b> Ein anonymisiertes
+  Dokument bleibt eingestuft. Namen zu entfernen macht einen Inhalt nicht freigabefaehig,
+  und Rolle plus Projekt plus Datum identifizieren eine Person auch ohne Namen.
+  Die Freigabeentscheidung liegt bei dir, nicht beim Modell.
+</div>
+
+<div class="panel">
+  <div class="row">
+    <input type="file" id="file" accept=".pdf,.docx,.xlsx,.pptx,.csv,.txt,.eml,.msg,.md">
+    <button id="scanBtn">Pruefen</button>
+    <span id="cfg" class="hint"></span>
+  </div>
+  <div class="row">
+    <label for="model">LLM</label>
+    <select id="model"><option value="">(laedt…)</option></select>
+    <button id="llmBtn" class="ghost" disabled>LLM-Durchlauf (Namen im Freitext)</button>
+    <button id="stopBtn" class="ghost" disabled>Stopp</button>
+  </div>
+  <div id="bar"><i></i></div>
+  <div class="row" style="justify-content:space-between">
+    <span id="prog" class="hint">bereit</span>
+    <span id="stats" class="hint" style="font-family:var(--mono)"></span>
+  </div>
+</div>
+
+<div id="warns"></div>
+
+<div class="cols" id="work" style="display:none">
+  <div>
+    <div class="row" style="margin-bottom:8px">
+      <span class="badge" style="background:#dbeafe;color:#1e3a8a">Muster · deterministisch</span>
+      <span class="badge" style="background:#ffedd5;color:#7c2d12">LLM · Vorschlag, pruefen</span>
+      <span class="badge" style="background:#dcfce7;color:#14532d">manuell</span>
+    </div>
+    <div id="view"></div>
+    <div class="row" style="margin-top:8px">
+      <label for="tok">Ersatz</label>
+      <select id="tok">
+        <option>[NAME]</option><option>[ORT]</option><option>[PROJEKT]</option>
+        <option>[ORGANISATION]</option><option>[NUMMER]</option><option>[GESCHWAERZT]</option>
+      </select>
+      <button id="selBtn" class="ghost" disabled>Auswahl markieren</button>
+      <button id="allOccBtn" class="ghost" disabled>Alle Vorkommen markieren</button>
+      <span id="selInfo" class="hint" style="margin-left:auto"></span>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <button id="applyBtn">Anonymisierten Text erzeugen</button>
+      <button id="copyBtn" class="ghost" disabled>In Zwischenablage</button>
+      <button id="dlBtn" class="ghost" disabled>Als .txt speichern</button>
+    </div>
+    <textarea id="out" style="margin-top:10px;display:none" readonly></textarea>
+  </div>
+  <div>
+    <div class="row" style="margin-bottom:8px">
+      <button id="allBtn" class="ghost">Alle</button>
+      <button id="noneBtn" class="ghost">Keine</button>
+      <span id="cnt" class="hint" style="margin-left:auto"></span>
+    </div>
+    <div id="list"></div>
+    <div class="hint" style="margin-top:10px">
+      <b>Manuell markieren:</b> Text links mit der Maus auswaehlen, Ersatz-Token
+      waehlen, dann "Auswahl markieren" (nur diese Stelle) oder "Alle Vorkommen".
+      <br><br>
+      Abgewaehlte Funde bleiben im Text stehen. Pruefe besonders die orangen
+      LLM-Vorschlaege: das Modell erkennt Namen, die auch Substantive sind
+      (Bauer, Koch, Wyss), unzuverlaessig — in beide Richtungen.
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+let DOC = null, HITS = [], llm = null, llmReady = null, stopped = false;
+
+function esc(s){return s.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+function setProg(t){ $('#prog').textContent = t; }
+function bar(p){ $('#bar>i').style.width = Math.round((p||0)*100) + '%'; }
+
+// --------------------------------------------------------------- Konfiguration
+fetch('/api/anon/config').then(r=>r.json()).then(c=>{
+  $('#cfg').textContent = `${c.muster.length} Muster · ${c.begriffe} Begriffe aus _anon`;
+  showWarns(c.warnungen);
+}).catch(()=>{ $('#cfg').textContent = 'Konfiguration nicht lesbar'; });
+
+fetch('/api/models').then(r=>r.json()).then(d=>{
+  const sel = $('#model'); sel.innerHTML = '';
+  (d.llm||[]).forEach(m => sel.add(new Option(m, m)));
+  if (!sel.options.length) sel.add(new Option('(kein Modell gefunden)',''));
+}).catch(()=>{});
+
+function showWarns(w){
+  if (!w || !w.length) return;
+  $('#warns').innerHTML = '<div class="warnbox"><b>Konfiguration:</b><br>' +
+    w.map(esc).join('<br>') + '</div>';
+}
+
+// --------------------------------------------------------------- Scan
+$('#scanBtn').onclick = async () => {
+  const f = $('#file').files[0];
+  if (!f) { setProg('keine Datei gewaehlt'); return; }
+  setProg('lese ' + f.name + ' …'); bar(0.3);
+  const fd = new FormData(); fd.append('file', f);
+  try {
+    const r = await fetch('/api/anon/scan', { method:'POST', body: fd });
+    const d = await r.json();
+    if (d.error) { setProg('Fehler: ' + d.error); bar(0); return; }
+    // Doppelte Absicherung: normalisiert bereits das Backend (ab 20260908v02),
+    // aendert das hier nichts. Laeuft noch ein aelteres anon_module.py, wuerden
+    // sonst die DOM-Offsets der manuellen Markierung verrutschen.
+    if (/\r/.test(d.text)) {
+      setProg('Hinweis: Backend liefert \\r\\n — bitte anon_module.py aktualisieren.');
+      d.text = d.text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+      d.hits = [];              // Offsets der Musterfunde passen dann nicht mehr
+    }
+    DOC = d;
+    HITS = d.hits.map((h,i) => ({...h, id:i, on:true}));
+    showWarns(d.warnungen);
+    $('#work').style.display = 'grid';
+    $('#llmBtn').disabled = false;
+    $('#stats').textContent = `${d.stats.zeichen} Zeichen · ${d.stats.treffer} Musterfunde · ${d.windows.length} Fenster`;
+    render(); bar(1); setProg('Musterpruefung fertig');
+  } catch(e) { setProg('Fehler: ' + e.message); bar(0); }
+};
+
+// --------------------------------------------------------------- Darstellung
+function render(){
+  const t = DOC.text;
+  const sorted = [...HITS].sort((a,b)=>a.start-b.start);
+  let html = '', pos = 0;
+  for (const h of sorted) {
+    if (h.start < pos) continue;
+    html += esc(t.slice(pos, h.start));
+    const cls = h.on ? (h.quelle==='llm'?'l':(h.quelle==='manuell'?'h':'m')) : 'off';
+    html += `<mark class="${cls}" title="${esc(h.muster)} -> ${esc(h.ersatz)}">${esc(h.text)}</mark>`;
+    pos = h.end;
+  }
+  html += esc(t.slice(pos));
+  $('#view').innerHTML = html;
+
+  $('#list').innerHTML = sorted.map(h =>
+    `<label class="hit ${h.quelle==='llm'?'llm':(h.quelle==='manuell'?'man':'')}">
+       <input type="checkbox" data-id="${h.id}" ${h.on?'checked':''}>
+       <span class="t">${esc(h.text)}<span class="s">${esc(h.muster)} · ${esc(h.ersatz)}</span></span>
+     </label>`).join('') || '<div class="hit"><span class="t">keine Funde</span></div>';
+
+  $('#list').querySelectorAll('input').forEach(cb => cb.onchange = () => {
+    const h = HITS.find(x => x.id === +cb.dataset.id);
+    if (h) { h.on = cb.checked; render(); }
+  });
+  const on = HITS.filter(h=>h.on).length;
+  $('#cnt').textContent = `${on} / ${HITS.length} aktiv`;
+}
+
+// --------------------------------------------------------------- Manuelle Markierung
+// Die Zeichenoffsets im DOM entsprechen exakt denen in DOC.text: gerendert wird nur
+// HTML-escaped (&amp; ist im Textknoten wieder EIN Zeichen) und <mark> fuegt keinen
+// Text ein. Deshalb genuegt es, die Laengen der Textknoten bis zur Auswahl zu addieren.
+function offsetOf(node, off){
+  const root = $('#view');
+  if (!root.contains(node)) return -1;
+  const tw = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  let n, sum = 0;
+  while ((n = tw.nextNode())) {
+    if (n === node) return sum + off;
+    sum += n.nodeValue.length;
+  }
+  return -1;
+}
+
+function currentSelection(){
+  const s = window.getSelection();
+  if (!s || s.isCollapsed || !s.rangeCount) return null;
+  const r = s.getRangeAt(0);
+  let a = offsetOf(r.startContainer, r.startOffset);
+  let b = offsetOf(r.endContainer,   r.endOffset);
+  if (a < 0 || b < 0 || b <= a) return null;
+
+  // SICHERUNGSGURT: Der aus dem DOM gemessene Offset muss auf denselben Text
+  // zeigen wie die Auswahl. Weicht er ab (z.B. weil der HTML-Parser Zeichen
+  // normalisiert hat), wird der Auswahltext in der Naehe neu gesucht statt
+  // blind eine falsche Stelle zu schwaerzen.
+  const want = s.toString();
+  if (want && DOC.text.slice(a, b) !== want) {
+    const near = DOC.text.indexOf(want, Math.max(0, a - 2000));
+    const idx  = near !== -1 ? near : DOC.text.indexOf(want);
+    if (idx === -1) return null;          // nicht auffindbar -> lieber nichts tun
+    a = idx; b = idx + want.length;
+  }
+  return { start:a, end:b, text: DOC.text.slice(a,b) };
+}
+
+document.addEventListener('selectionchange', () => {
+  if (!DOC) return;
+  const sel = currentSelection();
+  const ok = !!sel && sel.text.trim().length > 0;
+  $('#selBtn').disabled = !ok;
+  $('#allOccBtn').disabled = !ok;
+  $('#selInfo').textContent = ok ? `"${sel.text.slice(0,40)}" (${sel.text.length} Z.)` : '';
+});
+
+function addHit(start, end, text, ersatz){
+  // Ueberlappungen verwerfen: sonst schneidet die Ersetzung Treffer auseinander.
+  if (HITS.some(h => start < h.end && end > h.start)) return false;
+  HITS.push({ id: HITS.length, start, end, text,
+              muster:'manuell', ersatz, quelle:'manuell', on:true });
+  return true;
+}
+
+$('#selBtn').onclick = () => {
+  const sel = currentSelection(); if (!sel) return;
+  // Fuehrende/folgende Leerzeichen aus der Auswahl schneiden - sonst wird der
+  // Abstand mitgeschwaerzt und der Text laeuft zusammen.
+  let {start, end} = sel;
+  while (start < end && /\s/.test(DOC.text[start]))   start++;
+  while (end > start && /\s/.test(DOC.text[end-1]))   end--;
+  if (end <= start) return;
+  const ok = addHit(start, end, DOC.text.slice(start,end), $('#tok').value);
+  window.getSelection().removeAllRanges();
+  setProg(ok ? 'Auswahl markiert' : 'Auswahl ueberlappt einen bestehenden Fund');
+  render();
+};
+
+$('#allOccBtn').onclick = () => {
+  const sel = currentSelection(); if (!sel) return;
+  const term = sel.text.trim();
+  if (term.length < 2) return;
+  const tok = $('#tok').value;
+  let from = 0, idx, n = 0;
+  while ((idx = DOC.text.indexOf(term, from)) !== -1) {
+    from = idx + term.length;
+    if (addHit(idx, from, term, tok)) n++;
+  }
+  window.getSelection().removeAllRanges();
+  setProg(`${n} Vorkommen von "${term.slice(0,30)}" markiert`);
+  render();
+};
+
+$('#allBtn').onclick  = () => { HITS.forEach(h=>h.on=true);  render(); };
+$('#noneBtn').onclick = () => { HITS.forEach(h=>h.on=false); render(); };
+
+// --------------------------------------------------------------- LLM-Durchlauf
+const SYS = `Du bist ein Werkzeug zur Erkennung personenbezogener Angaben.
+Gib AUSSCHLIESSLICH eine Liste der im Text vorkommenden Eigennamen aus:
+Personennamen, Organisationsnamen, Projektnamen, Ortsnamen.
+Eine Zeile pro Fund. Schreibe die Zeichenfolge EXAKT so, wie sie im Text steht.
+Keine Nummerierung, keine Erklaerung, keine Wiederholung des Textes.
+Wenn nichts gefunden wird, gib das Wort KEINE aus.`;
+
+function makeWorker(){
+  const w = new Worker('/static/llm_worker.js', { type:'module' });
+  const waiters = new Map();
+  let readyRes, readyRej;
+  const readyP = new Promise((res,rej)=>{ readyRes=res; readyRej=rej; });
+  w.onmessage = e => {
+    const d = e.data || {};
+    if (d.type === 'ready') { readyRes(true); return; }
+    if (d.type === 'error' && !d.requestId) { readyRej(new Error(d.text)); return; }
+    if (d.progress !== undefined || d.text && !d.requestId) { setProg(d.text || ''); if(d.progress!==undefined) bar(d.progress); }
+    if (d.requestId && waiters.has(d.requestId)) {
+      if (d.type === 'done')  { waiters.get(d.requestId).res(d); waiters.delete(d.requestId); }
+      if (d.type === 'error') { waiters.get(d.requestId).rej(new Error(d.text)); waiters.delete(d.requestId); }
+    }
+  };
+  return {
+    readyP,
+    load: name => { w.postMessage({ type:'load', model_name:name }); return readyP; },
+    gen: prompt => new Promise((res,rej)=>{
+      const requestId = Math.random().toString(36).slice(2);
+      waiters.set(requestId, {res,rej});
+      w.postMessage({ type:'generate', prompt, systemPrompt:SYS, maxNewTokens:220, requestId });
+    }),
+    kill: () => w.terminate()
+  };
+}
+
+$('#stopBtn').onclick = () => { stopped = true; setProg('Abbruch nach aktuellem Fenster …'); };
+
+$('#llmBtn').onclick = async () => {
+  const model = $('#model').value;
+  if (!model) { setProg('kein Modell gewaehlt'); return; }
+  stopped = false;
+  $('#llmBtn').disabled = true; $('#stopBtn').disabled = false;
+  try {
+    if (!llm) { llm = makeWorker(); setProg('lade Modell …'); await llm.load(model); }
+    const wins = DOC.windows;
+    let added = 0;
+    for (let i = 0; i < wins.length; i++) {
+      if (stopped) break;
+      setProg(`Fenster ${i+1} / ${wins.length}`); bar((i)/wins.length);
+      const d = await llm.gen(wins[i].text);
+      added += absorb(d.text || '');
+      render();
+    }
+    bar(1); setProg(stopped ? `abgebrochen · ${added} LLM-Funde` : `LLM-Durchlauf fertig · ${added} zusaetzliche Funde`);
+  } catch(e) { setProg('LLM-Fehler: ' + e.message); }
+  $('#llmBtn').disabled = false; $('#stopBtn').disabled = true;
+};
+
+function absorb(answer){
+  const t = DOC.text;
+  let n = 0;
+  const lines = answer.split('\n').map(s => s.replace(/^[\s\-\*\d.)]+/, '').trim())
+                      .filter(s => s && s.length >= 3 && s.length <= 60 && !/^KEINE$/i.test(s));
+  for (const term of new Set(lines)) {
+    // Nur uebernehmen, was WOERTLICH im Text steht. Alles andere ist Halluzination.
+    let from = 0, idx;
+    while ((idx = t.indexOf(term, from)) !== -1) {
+      from = idx + term.length;
+      const clash = HITS.some(h => idx < h.end && from > h.start);
+      if (clash) continue;
+      HITS.push({ id: HITS.length, start: idx, end: from, text: term,
+                  muster: 'LLM-Vorschlag', ersatz: '[NAME]', quelle: 'llm', on: true });
+      n++;
+    }
+  }
+  return n;
+}
+
+// --------------------------------------------------------------- Ersetzung
+$('#applyBtn').onclick = () => {
+  const t = DOC.text;
+  const sorted = HITS.filter(h=>h.on).sort((a,b)=>a.start-b.start);
+  let out = '', pos = 0;
+  for (const h of sorted) {
+    if (h.start < pos) continue;
+    out += t.slice(pos, h.start) + h.ersatz;
+    pos = h.end;
+  }
+  out += t.slice(pos);
+  const ta = $('#out'); ta.value = out; ta.style.display = 'block';
+  $('#copyBtn').disabled = false; $('#dlBtn').disabled = false;
+  setProg(`${sorted.length} Stellen ersetzt · ${out.length} Zeichen`);
+};
+
+$('#copyBtn').onclick = async () => {
+  try { await navigator.clipboard.writeText($('#out').value); setProg('kopiert'); }
+  catch { $('#out').select(); document.execCommand('copy'); setProg('kopiert'); }
+};
+
+$('#dlBtn').onclick = () => {
+  const blob = new Blob([$('#out').value], { type:'text/plain;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = (DOC.filename || 'dokument').replace(/\.[^.]+$/, '') + '_anon.txt';
+  a.click(); URL.revokeObjectURL(a.href);
+};
+</script>
+</body>
+</html>

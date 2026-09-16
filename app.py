@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-tiseR - RAG-Backend   [Version 20260805v04] (AppLocker-konform, KEINE nativen DLLs)
+tiseR - RAG-Backend   [Version 20260916v02] (AppLocker-konform, KEINE nativen DLLs)
 Optimierungen ggue. v1:
   1. Strukturbewusstes Chunking (Ueberschriften-Schnitte, ToC/Kopfzeilen entfernt,
      Ueberschrift als Praefix im Chunk).
@@ -18,9 +18,47 @@ Optimierungen ggue. v1:
   7. Markdown (.md/.markdown) als Eingabeformat — inkl. YAML-Frontmatter (OKF-tauglich).
      KEIN Konverter: andere Formate werden NICHT nach Markdown gewandelt, nur native
      .md-Dateien direkt gelesen. Frontmatter-Tags fliessen in die Chunk-Tags ein.
+  8. GarbageCheck am INGEST (20260815v01): zeichenstatistische Erkennung kaputter
+     Textlayer (Browser-PDF-Exporte mit subgesetzten Fonts). Laeuft per Default im
+     MESSMODUS (GARBAGE_REJECT = False) — misst und meldet, verwirft nichts.
+  9. Eval-Harness Variante B (20260904v01): optionale Einbindung von eval_module.py
+     am Ende der Routen-Sektion. Misst Recall@k / Coverage / MRR des ECHTEN
+     Hybrid-Retrievals gegen ein XLSX-Frage/Antwort-Set. Fehlt das Modul, laeuft
+     tiseR unveraendert weiter.
+ 10. Glossar-Modus fuer XLSX unter "eval" (20260905v01): Ortsregel statt Formatregel.
+     Eine XLSX unterhalb von "eval" wird als Glossar (Frage|Antwort|Thema|Quelle) gelesen
+     und je Zeile zu einem eigenen Chunk mit '## Begriff'-Ueberschrift. Blaetter mit
+     '_'-Praefix bleiben reine Messdaten und gehen NIE in den Index. Jede XLSX ausserhalb
+     von "eval" laeuft unveraendert durch extract_xlsx_text(). Der Ingest ist fuer diese
+     Dateien idempotent (alte Chunks werden ersetzt statt dupliziert).
+ 11. Glossar-Upload (20260905v02): /api/ingest_glossary nimmt eine XLSX entgegen,
+     legt sie in "eval" ab und indiziert sie im Glossar-Modus. Eigener Knopf im
+     Dokumente-Dialog, getrennt vom normalen Upload.
+ 12. Anonymisierung (20260908v01): optionale Einbindung von anon_module.py am Ende
+     der Routen-Sektion. Markiert schuetzenswerte Stellen einer hochgeladenen Datei
+     (Strukturmuster aus anon_patterns.json + Begriffe aus dem Blatt '_anon' der
+     Glossar-XLSX) und ersetzt sie erst nach manueller Freigabe im Browser.
+     ENTSCHEIDET NICHT ueber Klassifizierung — ein anonymisiertes Dokument bleibt
+     eingestuft. Fehlt das Modul, laeuft tiseR unveraendert weiter.
+ 13. Dubletten-Check + Kontext-Vorspann (20260916v01):
+     - Jeder Chunk traegt den SHA-1 des extrahierten Dokumenttexts (Spalte doc_hash).
+       Gleicher Inhalt (egal welcher Name) -> uebersprungen; gleicher Name, neuer
+       Inhalt -> alte Chunks ersetzt. Schuetzt df/avgdl im BM25 vor Mehrfach-"Laden".
+     - CTX_PREFIX (Default False): "Dokumenttitel > Ueberschrift: " vor jedem Chunk
+       (Embedding UND BM25). Wirkt nur auf NEU eingelesene Dokumente -> fuer die
+       Messung Korpus zuruecksetzen und neu einlesen.
+ 14. Vektoren als float32-BLOB + DB-Name tiser.db (20260916v02):
+     - vec wird als float32-BLOB (array-Modul, numpy-frei) statt JSON gespeichert.
+       Spart ca. 75-85 % DB-Groesse und json.loads beim Start.
+     - Beim 1. Start: armachat.db wird nach tiser.db KOPIERT (Original bleibt als
+       Rollback-Sicherung liegen), JSON-Vektoren werden konvertiert, danach VACUUM.
+     - Dimensionspruefung beim Laden: Vektoren mit abweichender Dimension werden
+       NICHT geladen und im Log gemeldet (Schutz bei Embedding-Modellwechsel).
+     - ACHTUNG: Aeltere tiseR-Versionen koennen tiser.db nicht lesen.
 PDF-Extraktion: pypdf (reines Python).
 """
-import io, json, math, re, sqlite3, logging, zipfile
+import io, json, math, re, sqlite3, logging, zipfile, hashlib, shutil, sys
+from array import array
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from flask import Flask, request, jsonify, send_from_directory, g, abort
@@ -32,13 +70,15 @@ except Exception as _e:
     PDF_OK, _PDF_ERR = False, str(_e)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("armachat")
+log = logging.getLogger("tiser")
 
 APP_DIR    = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
 MODELS_DIR = APP_DIR / "models"
 DATA_DIR   = APP_DIR / "data"
-DB_PATH    = APP_DIR / "armachat.db"
+EVAL_DIR   = APP_DIR / "eval"   # Glossar-/Eval-XLSX (Sonderbehandlung, siehe unten)
+DB_PATH    = APP_DIR / "tiser.db"
+LEGACY_DB  = APP_DIR / "armachat.db"   # 20260916v02: nur fuer einmalige Migration
 HOST, PORT = "127.0.0.1", 8000
 
 CHUNK_TARGET = 500      # Ziel-Zeichen/Chunk: passt ins Embedding-Fenster (~128 Tokens)
@@ -54,6 +94,9 @@ PAGE_BREAK   = "\x0c"   # Seiten-/Foliengrenze -> harter Chunk-Schnitt
 # z.B. 1.15 erhoehen, NACHDEM eval_harness.py Hybrid+Boost gegen reines BM25
 # gemessen hat. Vorher waere jede Zahl reines Bauchgefuehl.
 TAG_BOOST    = 1.0
+# 20260916v01: Dokumenttitel als Chunk-Vorspann. Aus bis Golden-Set-Messung den Nutzen belegt.
+CTX_PREFIX   = False
+CTX_TITLE_MAX = 60
 
 app = Flask(__name__, static_folder=None)
 app.config["MAX_CONTENT_LENGTH"] = 80 * 1024 * 1024
@@ -79,7 +122,38 @@ def close_db(exc):
     db = g.pop("db", None)
     if db: db.close()
 
+# --------------------------------------------------------------- Vektor-Serialisierung (20260916v02)
+def vec_to_blob(vec) -> bytes:
+    a = array("f", vec)
+    if sys.byteorder != "little": a.byteswap()   # auf Platte immer little-endian
+    return a.tobytes()
+
+def blob_to_vec(raw) -> list:
+    if isinstance(raw, str):                      # Altbestand (JSON), falls Migration unvollstaendig
+        return json.loads(raw)
+    a = array("f"); a.frombytes(raw)
+    if sys.byteorder != "little": a.byteswap()
+    return a.tolist()
+
+def _migrate_legacy_db():
+    """armachat.db -> tiser.db kopieren (nicht verschieben: Rollback bleibt moeglich)."""
+    if not DB_PATH.exists() and LEGACY_DB.exists():
+        shutil.copy2(LEGACY_DB, DB_PATH)
+        log.info("Migration: %s nach %s kopiert (Original bleibt als Sicherung).",
+                 LEGACY_DB.name, DB_PATH.name)
+
+def _migrate_vec_blobs(conn):
+    """JSON-Vektoren einmalig in float32-BLOBs umwandeln, danach VACUUM."""
+    rows = conn.execute("SELECT id, vec FROM chunks WHERE typeof(vec)='text'").fetchall()
+    if not rows: return
+    for r in rows:
+        conn.execute("UPDATE chunks SET vec=? WHERE id=?", (vec_to_blob(json.loads(r["vec"])), r["id"]))
+    conn.commit()
+    conn.execute("VACUUM")
+    log.info("Migration: %d Vektoren von JSON auf float32-BLOB umgestellt.", len(rows))
+
 def init_db():
+    _migrate_legacy_db()
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row   # FIX: ohne dies sind Zeilen Tupel -> r["id"] crasht bei gefuellter DB
     conn.execute("""CREATE TABLE IF NOT EXISTS chunks(
@@ -90,15 +164,29 @@ def init_db():
         conn.execute("ALTER TABLE chunks ADD COLUMN tags TEXT")
     except sqlite3.OperationalError:
         pass   # Spalte existiert bereits -> nichts zu tun
+    try:   # 20260916v01: Dokument-Hash fuer Dubletten-Check
+        conn.execute("ALTER TABLE chunks ADD COLUMN doc_hash TEXT")
+    except sqlite3.OperationalError:
+        pass
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_chunks_hash ON chunks(doc_hash)")
     conn.commit()
+    _migrate_vec_blobs(conn)
     VECTORS.clear()
+    dim = None; bad = 0
     for r in conn.execute("SELECT id, source, text, vec, tags FROM chunks WHERE vec IS NOT NULL"):
+        v = blob_to_vec(r["vec"])
+        if dim is None: dim = len(v)
+        if len(v) != dim:          # Mischbestand aus zwei Embedding-Modellen -> nicht laden
+            bad += 1; continue
         VECTORS.append({"id": r["id"], "source": r["source"], "text": r["text"],
-                        "vec": json.loads(r["vec"]), "toks": _tok(r["text"]),
+                        "vec": v, "toks": _tok(r["text"]),
                         "tags": json.loads(r["tags"]) if r["tags"] else []})
     conn.close()
     rebuild_bm25()
-    log.info("DB bereit. %d Chunks mit Vektor.", len(VECTORS))
+    if bad:
+        log.warning("%d Chunks mit abweichender Vektor-Dimension (erwartet %d) NICHT geladen "
+                    "-> Korpus zuruecksetzen und neu einlesen.", bad, dim)
+    log.info("DB bereit. %d Chunks mit Vektor (Dim %s).", len(VECTORS), dim)
 
 # --------------------------------------------------------------- PDF (Standard-Extraktion)
 def extract_pdf_text(src) -> str:
@@ -396,7 +484,127 @@ def _md_seed_tags(src) -> list:
     _body, _title, tags = _parse_frontmatter(_decode(_read_bytes(src)))
     return tags
 
-# Dispatcher nach Dateiendung. PdfReader/ZipFile/olefile akzeptieren Pfad ODER BytesIO.
+# --------------------------------------------------------------- Glossar-XLSX (nur eval\)
+# WARUM EIN SONDERWEG: extract_xlsx_text() macht aus jeder Zeile "Zelle | Zelle | …".
+# Fuer Datentabellen ist das richtig. Fuer ein Glossar ist es falsch: die Struktur
+# "Begriff -> Definition" geht verloren, make_chunks() findet keine Ueberschrift und
+# setzt deshalb KEINEN Praefix, und aufeinanderfolgende Eintraege laufen ineinander
+# (ein Chunk endet mitten im naechsten Begriff). Gemessen an der realen Datei:
+# 380 praefixlose Chunks statt 63 sauber geschnittener.
+#
+# ORTSREGEL statt Formatregel: XLSX-Dateien UNTERHALB von eval\ werden als Glossar
+# gelesen (Kopfzeile Frage | Antwort | Thema | Quelle). Jede andere XLSX-Datei laeuft
+# unveraendert durch extract_xlsx_text(). Damit aendert sich am bestehenden Verhalten
+# fuer alle bisherigen Dokumente NICHTS.
+#
+# Erzeugt wird Markdown: "## <Begriff>" + Frage + Antwort. Die Frage bleibt im Text,
+# weil sie die natuerlichsprachliche Formulierung liefert, nach der Nutzer suchen —
+# der Begriff allein deckt das Vokabular nicht ab.
+GLOSSARY_SHEET_SKIP = "_"   # Blaetter mit diesem Praefix sind REINE Messdaten (nie Index)
+
+def _xlsx_rows(src):
+    """Liefert (blattname, [zellwerte]) je Zeile. Spaltenposition bleibt erhalten,
+    auch wenn leere Zellen in der XML fehlen."""
+    def _col(ref):
+        n = 0
+        for ch in ref:
+            if ch.isalpha(): n = n * 26 + (ord(ch.upper()) - 64)
+            else: break
+        return n - 1
+    _RNS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+    with zipfile.ZipFile(src) as z:
+        names = z.namelist()
+        shared = []
+        if "xl/sharedStrings.xml" in names:
+            with z.open("xl/sharedStrings.xml") as f:
+                for si in ET.parse(f).getroot().iter(_S + "si"):
+                    shared.append("".join(t.text or "" for t in si.iter(_S + "t")))
+        sheets = []
+        try:
+            with z.open("xl/workbook.xml") as f:
+                wbroot = ET.parse(f).getroot()
+            rels = {}
+            with z.open("xl/_rels/workbook.xml.rels") as f:
+                for rel in ET.parse(f).getroot():
+                    rels[rel.get("Id")] = rel.get("Target")
+            for sh in wbroot.iter(_S + "sheet"):
+                tgt = (rels.get(sh.get(_RNS + "id"), "") or "").lstrip("/")
+                if not tgt.startswith("xl/"): tgt = "xl/" + tgt
+                sheets.append((sh.get("name"), tgt))
+        except Exception:
+            sheets = [(n.split("/")[-1], n) for n in sorted(names)
+                      if n.startswith("xl/worksheets/") and n.endswith(".xml")]
+        for sheet_name, target in sheets:
+            if target not in names: continue
+            with z.open(target) as f:
+                wroot = ET.parse(f).getroot()
+            for row in wroot.iter(_S + "row"):
+                vals = {}
+                for c in row.iter(_S + "c"):
+                    typ = c.get("t"); ref = c.get("r") or ""; out = ""
+                    if typ == "s":
+                        v = c.find(_S + "v")
+                        if v is not None and v.text is not None:
+                            try: out = shared[int(v.text)]
+                            except (ValueError, IndexError): out = ""
+                    elif typ == "inlineStr":
+                        isn = c.find(_S + "is")
+                        if isn is not None:
+                            out = "".join(x.text or "" for x in isn.iter(_S + "t"))
+                    else:
+                        v = c.find(_S + "v")
+                        out = (v.text or "") if v is not None else ""
+                    vals[_col(ref)] = (out or "").strip()
+                if vals:
+                    width = max(vals) + 1
+                    yield sheet_name, [vals.get(i, "") for i in range(width)]
+
+def _term_from(frage: str, thema: str) -> str:
+    """Ueberschrift eines Glossar-Chunks. Bevorzugt Spalte 'Thema' (dort steht der
+    Begriff). Fehlt sie, wird der Begriff aus der Frage geschaelt
+    ('Was ist X (auch Y)?' -> 'X (auch Y)')."""
+    if thema: return thema
+    m = re.match(r'^\s*(?:Was\s+(?:ist|bedeutet|sind)|Wofuer\s+steht|Wofür\s+steht)\s+(.+?)\s*\??$',
+                 frage or "", re.I)
+    term = (m.group(1) if m else (frage or "")).strip(" ?")
+    return term[:80]
+
+def extract_xlsx_glossary_text(src) -> str:
+    """XLSX mit Kopfzeile Frage|Antwort|Thema|Quelle -> Markdown-Glossar.
+    Blaetter mit GLOSSARY_SHEET_SKIP-Praefix werden uebersprungen: sie sind
+    Messdaten (z.B. Mailkorpus-Fragen) und duerfen NIE in den Index, sonst misst
+    die Evaluation sich selbst."""
+    out, cur_sheet, header_seen = [], None, False
+    for sheet, vals in _xlsx_rows(src):
+        if sheet != cur_sheet:
+            cur_sheet, header_seen = sheet, False
+        if str(sheet or "").startswith(GLOSSARY_SHEET_SKIP):
+            continue
+        get = lambda i: vals[i] if i < len(vals) else ""
+        frage, antwort, thema, quelle = get(0), get(1), get(2), get(3)
+        if not header_seen:
+            header_seen = True
+            if frage.lower().startswith(("frage", "begriff", "term")):
+                continue                       # Kopfzeile
+        if not frage or not antwort:
+            continue                           # unvollstaendige Zeile still ueberspringen
+        if out: out.append(PAGE_BREAK)         # harter Schnitt zwischen Eintraegen
+        out.append("## " + _term_from(frage, thema))
+        line = frage.rstrip("?") + "? " + antwort
+        if quelle: line += f" (Quelle: {quelle}; Blatt: {sheet})"
+        out.append(line)
+    return "\n".join(out)
+
+def _is_glossary_path(src) -> bool:
+    """True, wenn der Pfad unterhalb von eval\\ liegt. Nur Pfade, keine BytesIO —
+    ein Upload ueber 'Laden' bleibt bewusst eine normale XLSX."""
+    if hasattr(src, "read"): return False
+    try:
+        return EVAL_DIR.resolve() in Path(src).resolve().parents
+    except Exception:
+        return False
+
+
 _EXT_HANDLERS = {
     ".pdf": extract_pdf_text,   ".docx": extract_docx_text, ".xlsx": extract_xlsx_text,
     ".pptx": extract_pptx_text, ".csv": extract_csv_text,   ".txt": extract_txt_text,
@@ -416,6 +624,10 @@ def extract_text_any(name: str, src):
     # .md kann BytesIO/Pfad sein; seed_tags brauchen einen zweiten Lesedurchgang.
     # Bei BytesIO daher vor dem Handler-Aufruf die Tags ziehen und zuruecksetzen.
     seed_tags = []
+    if ext == ".xlsx" and _is_glossary_path(src):
+        # Ortsregel: XLSX unter eval\ ist ein Glossar. Seed-Tag 'glossar' macht
+        # 'tags:glossar' als Suchoperator sofort nutzbar.
+        return extract_xlsx_glossary_text(src), ["glossar"]
     if ext in (".md", ".markdown"):
         if hasattr(src, "read"):
             seed_tags = _md_seed_tags(src)
@@ -423,6 +635,103 @@ def extract_text_any(name: str, src):
         else:
             seed_tags = _md_seed_tags(src)
     return handler(src), seed_tags
+
+# --------------------------------------------------------------- GarbageCheck (Ingest-Qualitaetsfilter)
+# ANLASS: Ein per Browser "Drucken -> PDF" erzeugtes Web-PDF hat oft einen Textlayer
+# mit subgesetzten Fonts ohne verwertbares ToUnicode-CMap. pypdf liefert daraus
+# Zeichensalat ("+,, -../ 0\t1+ 23456789:4"). Der floss bisher UNBEMERKT durch:
+# _clean_lines() filtert ihn nicht, CHUNK_MIN=15 laesst ihn durch, der Ingest-Report
+# meldet "OK, n Chunks". Der Schaden bleibt NICHT lokal:
+#   - BM25: jedes Salat-Token ist ein Hapax -> maximales IDF. Kollidiert eines
+#     zufaellig mit einem Fragetoken, springt der Muell-Chunk nach oben. Zugleich
+#     verschiebt sich avgdl und damit die Laengennormalisierung ALLER Chunks.
+#   - Embedding: e5-large bildet Salat nicht auf "nichts" ab, sondern auf einen
+#     beliebigen Punkt — bei Fragen ohne guten echten Treffer eine plausible
+#     Cosine-Nachbarschaft.
+#   - RRF belohnt Konsens zweier Ranker und verstaerkt den Zufallstreffer.
+# Symptom fuer den Nutzer: "Dazu enthalten die Dokumente keine Angabe", obwohl die
+# Antwort indiziert ist. eval_harness.py sieht das NICHT (misst nur BM25-Recall).
+#
+# SCHARFSCHALTUNG: GARBAGE_REJECT bleibt False (Messmodus). Es wird NICHTS verworfen,
+# nur gemessen und im Ingest-Report ausgewiesen. Erst wenn die Werte gegen den
+# ECHTEN Korpus gemessen sind (Tabellen aus XLSX und abkuerzungslastige Chunks
+# liegen nahe an denselben Schwellen), auf True setzen — gleiche Disziplin wie
+# bei TAG_BOOST.
+GARBAGE_REJECT   = False   # True = Muell-Chunks verwerfen / Dokument ablehnen
+GARBAGE_DOC_MAX  = 0.30    # ab diesem Anteil Muell-Chunks gilt das DOKUMENT als kaputt
+
+# KALIBRIERUNG 20260815: Der erste Entwurf mass "Zeichen ausserhalb des erwarteten
+# Alphabets" und schlug am Referenzfall NICHT an — pypdf liefert bei subgesetzten
+# Fonts keinen Mojibake, sondern Glyph-Indizes ("/0 /1 /2 /3"), also reines ASCII.
+# Gemessen wird daher Buchstabenanteil und Wortdichte.
+_RX_MOJIBAKE = re.compile(r"[\uFFFD\u0080-\u009F]")
+_RX_ALPHA    = re.compile(r"[^\W\d_]", re.UNICODE)
+_RX_WORD     = re.compile(r"[^\W\d_]{3,}", re.UNICODE)
+
+# Schwellen (siehe Kalibrierung im Kopf dieses Abschnitts)
+GARBAGE_ALPHA    = 0.35    # Buchstabenanteil; deutscher Fliesstext liegt bei ~0.75
+GARBAGE_WORDDENS = 3.0     # Woerter (>=3 Buchstaben) je 100 Zeichen; Fliesstext ~12
+
+def _garbage_metrics(text: str):
+    """Liefert (alpha_ratio, word_density, mojibake_ratio).
+    Rein zeichenstatistisch, kein Sprachmodell — billig und deterministisch."""
+    n = len(text or "")
+    if not n:
+        return 1.0, 100.0, 0.0
+    alpha = len(_RX_ALPHA.findall(text)) / n
+    dens  = len(_RX_WORD.findall(text)) * 100.0 / n
+    moji  = len(_RX_MOJIBAKE.findall(text)) / n
+    return alpha, dens, moji
+
+def _is_garbage(text: str) -> bool:
+    """Zwei unabhaengige Signaturen kaputter Extraktion:
+      (A) Glyph-Index-Fallback: pypdf gibt '/0 /1 /2 …' aus, wenn der Font
+          subgesetzt ist und keine ToUnicode-CMap mitbringt. Ergebnis: fast keine
+          Buchstaben, gar keine Woerter. Beide Kriterien MUESSEN reissen — reine
+          Zahlenkolonnen haben zwar wenig Buchstaben, aber auch wenig Zeichen
+          insgesamt und werden ueber die Wortdichte nicht mitgerissen.
+      (B) Mojibake: Ersetzungszeichen und C1-Steuerzeichen aus falsch geratener
+          Kodierung."""
+    alpha, dens, moji = _garbage_metrics(text)
+    return (alpha < GARBAGE_ALPHA and dens < GARBAGE_WORDDENS) or moji > 0.02
+
+def screen_chunks(chunks, source: str):
+    """Bewertet die Chunks EINES Dokuments.
+    Rueckgabe (kept, stats). stats = {n, bad, ratio, doc_bad, badchar_avg, novowel_avg}.
+    Bei GARBAGE_REJECT=False ist kept IMMER == chunks (reiner Messmodus)."""
+    n = len(chunks)
+    stats = {"n": n, "bad": 0, "ratio": 0.0, "doc_bad": False,
+             "alpha_avg": 1.0, "dens_avg": 100.0}
+    if not n:
+        return chunks, stats
+    flags, asum, dsum = [], 0.0, 0.0
+    for c in chunks:
+        a, d, _mo = _garbage_metrics(c["text"])
+        asum += a; dsum += d
+        flags.append(_is_garbage(c["text"]))
+    stats["bad"]       = sum(flags)
+    stats["ratio"]     = stats["bad"] / n
+    stats["alpha_avg"] = asum / n
+    stats["dens_avg"]  = dsum / n
+    stats["doc_bad"]     = stats["ratio"] > GARBAGE_DOC_MAX
+    log.info("GarbageCheck %s: %d/%d Chunks auffaellig (%.0f%%), "
+             "alpha_avg=%.3f dens_avg=%.1f%s",
+             source, stats["bad"], n, stats["ratio"] * 100,
+             stats["alpha_avg"], stats["dens_avg"],
+             "  -> DOKUMENT waere abgelehnt" if stats["doc_bad"] else "")
+    if not GARBAGE_REJECT:
+        return chunks, stats                      # Messmodus: nichts verwerfen
+    if stats["doc_bad"]:
+        return [], stats                          # ganzes Dokument ablehnen
+    return [c for c, f in zip(chunks, flags) if not f], stats
+
+def _garbage_note(stats) -> str:
+    """Kurzer Zusatz fuer den Ingest-Report. Immer sichtbar, damit die Schwellen
+    am echten Korpus kalibriert werden koennen, bevor irgendetwas verworfen wird."""
+    if not stats["n"] or not stats["bad"]:
+        return ""
+    return (f" · GarbageCheck: {stats['bad']}/{stats['n']} auffaellig "
+            f"({stats['ratio']*100:.0f}%)")
 
 # --------------------------------------------------------------- Metadaten-Tagger (heuristisch)
 # Pure Python, AppLocker-safe. Bewusst konservativ. Tags landen SEPARAT (nie im Text).
@@ -474,12 +783,23 @@ def _clean_lines(text: str):
         out.append(ln)
     return out
 
+_RX_TITLE_ID = re.compile(r'(?<![A-Za-z0-9])(?:ar-)?[A-Z]-?[0-9A-F]{6,}(?:/\d+)?(?![A-Za-z0-9])|(?<![A-Za-z0-9])v?\d{8}v\d{2}(?![A-Za-z0-9])')
+
+def _doc_title(source: str) -> str:
+    """Lesbarer Titel aus dem Dateinamen: Endung, Dok-IDs, Versionsstempel und
+    Trennzeichen raus. Leer, wenn nichts Sinnvolles uebrig bleibt."""
+    t = _RX_TITLE_ID.sub(" ", Path(source).stem)
+    t = re.sub(r'\s+', ' ', re.sub(r'[_\-.]+', ' ', t)).strip()
+    if len(re.findall(r'[A-Za-zÄÖÜäöü]', t)) < 3: return ""
+    return t[:CTX_TITLE_MAX].rstrip()
+
 def make_chunks(text: str, source: str, seed_tags=()):
     """seed_tags: optionale Tags aus z.B. .md-Frontmatter, die JEDEM Chunk dieses
     Dokuments mitgegeben werden (zusaetzlich zu den heuristisch erkannten)."""
     lines = _clean_lines(text)
     chunks = []; cur = []; head = ""; L = 0; ordn = 0
     seed = list(dict.fromkeys(t.lower() for t in seed_tags))   # dedupe, stabil
+    title = _doc_title(source) if CTX_PREFIX else ""
     def flush():
         nonlocal cur, L, ordn
         if cur:
@@ -487,7 +807,8 @@ def make_chunks(text: str, source: str, seed_tags=()):
             if len(body) >= CHUNK_MIN:
                 # Nur die Ueberschrift als Praefix (echte Struktur); KEIN Dateiname
                 # mehr, der nur das Embedding-Fenster mit Rauschen fuellt.
-                prefix = f"{head}: " if head else ""
+                parts = [p for p in (title, head) if p]   # 20260916v01: CTX_PREFIX
+                prefix = (" > ".join(parts) + ": ") if parts else ""
                 full = prefix + body
                 # Tags aus Inhalt + Frontmatter-Seeds; Reihenfolge stabil, dedupe.
                 tags = list(dict.fromkeys(_tag_chunk(full) + seed))
@@ -511,11 +832,11 @@ def make_chunks(text: str, source: str, seed_tags=()):
     flush()
     return chunks
 
-def _store_chunks(conn, chunks):
+def _store_chunks(conn, chunks, doc_hash=None):
     pending = []; cur = conn.cursor()
     for c in chunks:
-        cur.execute("INSERT INTO chunks(source, ord, text, vec, tags) VALUES(?,?,?,NULL,?)",
-                    (c["source"], c["ord"], c["text"], json.dumps(c.get("tags") or [])))
+        cur.execute("INSERT INTO chunks(source, ord, text, vec, tags, doc_hash) VALUES(?,?,?,NULL,?,?)",
+                    (c["source"], c["ord"], c["text"], json.dumps(c.get("tags") or []), doc_hash))
         # Embedder bekommt NUR id+text — Tags bleiben absichtlich aussen vor.
         pending.append({"id": cur.lastrowid, "text": c["text"]})
     return pending
@@ -750,9 +1071,31 @@ def _ingest_one(conn, name, src, report, pending):
     except Exception as e: report.append({"file": name, "status": f"Lesefehler: {e}"}); return
     if not text or not text.strip():
         report.append({"file": name, "status": "LEER (kein Textlayer?)"}); return
+    # --- 20260916v01: Dubletten-Check ueber Inhalts-Hash (extrahierter Text) ----
+    h = hashlib.sha1(text.encode("utf-8", "replace")).hexdigest()
+    dup = conn.execute("SELECT source FROM chunks WHERE doc_hash=? LIMIT 1", (h,)).fetchone()
+    if dup:
+        report.append({"file": name, "status": "unverändert – übersprungen" if dup["source"] == name
+                       else f"Dublette von '{dup['source']}' – übersprungen"}); return
+    replaced = conn.execute("SELECT COUNT(*) FROM chunks WHERE source=?", (name,)).fetchone()[0]
+    if replaced:   # gleicher Name, neuer (oder nie gehashter) Inhalt -> ersetzen
+        conn.execute("DELETE FROM chunks WHERE source=?", (name,))
+        VECTORS[:] = [it for it in VECTORS if it["source"] != name]
+        rebuild_bm25()
     chunks = make_chunks(text, name, seed_tags)
-    pending.extend(_store_chunks(conn, chunks))
-    report.append({"file": name, "status": f"OK, {len(chunks)} Chunks"})
+    kept, gstats = screen_chunks(chunks, name)
+    if GARBAGE_REJECT and gstats["doc_bad"]:
+        report.append({"file": name, "status":
+            f"ABGELEHNT: Textlayer unbrauchbar ({gstats['ratio']*100:.0f}% Zeichensalat). "
+            f"Vermutlich Browser-'Drucken -> PDF' ohne einbettbare Fonts. "
+            f"Original-Datei statt PDF-Export verwenden."})
+        return
+    pending.extend(_store_chunks(conn, kept, h))
+    dropped = len(chunks) - len(kept)
+    status  = f"OK, {len(kept)} Chunks"
+    if replaced: status += f" (Version ersetzt, {replaced} alte Chunks entfernt)"
+    if dropped: status += f" ({dropped} als Zeichensalat verworfen)"
+    report.append({"file": name, "status": status + _garbage_note(gstats)})
 
 def _is_temp(name: str) -> bool:
     # Office-Sperrdateien (~$...) und versteckte Dateien ueberspringen
@@ -770,6 +1113,72 @@ def ingest():
     conn.commit()
     return jsonify({"report": report, "pending": pending})
 
+@app.route("/api/ingest_glossary", methods=["POST"])
+def ingest_glossary():
+    """Glossar-Upload: speichert die XLSX nach eval\\ und indiziert sie im
+    Glossar-Modus (siehe extract_xlsx_glossary_text).
+
+    ZWEI ROLLEN, EINE DATEI — bewusst so:
+      eval\\  ist Ablageort UND Messquelle. Der Harness liest dieselbe Datei.
+      Blaetter mit '_'-Praefix gehen NIE in den Index; sie bleiben reine Messdaten.
+
+    IDEMPOTENT: vorhandene Chunks derselben Datei werden ersetzt, nicht ergaenzt.
+    Ein Glossar ist ein gepflegtes Dokument — wiederholtes Hochladen nach einer
+    Ergaenzung muss funktionieren, ohne df/avgdl im BM25 zu verfaelschen."""
+    ups = request.files.getlist("files")
+    if not ups:
+        return jsonify({"error": "Keine Datei erhalten."}), 400
+    EVAL_DIR.mkdir(parents=True, exist_ok=True)
+
+    report, pending = [], []
+    conn = get_db()
+    try:
+        for up in ups:
+            name = Path(up.filename or "").name
+            if not name:
+                continue
+            if not name.lower().endswith(".xlsx"):
+                report.append({"file": name,
+                               "status": "übersprungen – Glossar muss .xlsx sein "
+                                         "(Frage | Antwort | Thema | Quelle)"})
+                continue
+            dest = EVAL_DIR / name
+            up.save(str(dest))
+
+            # Vorabpruefung: liefert die Datei ueberhaupt Glossarzeilen? Eine XLSX
+            # ohne passende Kopfzeile ergibt leeren Text — das soll der Nutzer
+            # erfahren, statt still 0 Chunks zu bekommen.
+            try:
+                probe = extract_xlsx_glossary_text(str(dest))
+            except Exception as e:
+                report.append({"file": name, "status": f"Fehler beim Lesen: {e}"})
+                continue
+            if not probe.strip():
+                report.append({"file": name,
+                               "status": "gespeichert, aber keine Glossarzeilen gefunden – "
+                                         "Kopfzeile 'Frage | Antwort | Thema | Quelle' erwartet"})
+                continue
+
+            had = conn.execute("SELECT COUNT(*) FROM chunks WHERE source=?",
+                               (name,)).fetchone()[0]
+            if had:
+                conn.execute("DELETE FROM chunks WHERE source=?", (name,))
+                VECTORS[:] = [it for it in VECTORS if it["source"] != name]
+                rebuild_bm25()
+
+            before = len(report)
+            _ingest_one(conn, name, str(dest), report, pending)
+            if len(report) > before:
+                report[-1]["status"] += (f" (Glossar aktualisiert, {had} alte Chunks ersetzt)"
+                                         if had else " (Glossar)")
+        conn.commit()
+    finally:
+        # get_db() haengt am Flask-Request-Kontext und wird per teardown_appcontext
+        # geschlossen. Hier bewusst KEIN conn.close() — identisch zu ingest_folder().
+        pass
+    return jsonify({"report": report, "pending": pending})
+
+
 @app.route("/api/ingest_folder", methods=["POST"])
 def ingest_folder():
     try:
@@ -780,13 +1189,36 @@ def ingest_folder():
         found = sorted((p for p in DATA_DIR.rglob("*")
                         if p.is_file() and p.suffix.lower() in SUPPORTED_EXT and not _is_temp(p.name)),
                        key=lambda p: p.name.lower())
-        if not found:
+        if not found and not (EVAL_DIR.exists() and any(EVAL_DIR.glob("*.xlsx"))):
             return jsonify({"report": [{"file": str(DATA_DIR),
                                         "status": "Keine PDF/DOCX/XLSX gefunden"}], "pending": []})
         for doc in found:
             if doc.name in existing:
                 report.append({"file": doc.name, "status": "bereits indiziert – übersprungen"}); continue
             _ingest_one(conn, doc.name, str(doc), report, pending)
+
+        # --- Glossare aus eval\ ---------------------------------------------
+        # Bewusst IDEMPOTENT statt "überspringen": ein Glossar ist ein gepflegtes
+        # Dokument, das sich aendert. Alte Chunks werden vorher entfernt, damit ein
+        # erneutes Einlesen die Aenderungen uebernimmt, ohne Dubletten zu erzeugen.
+        # (Dubletten wuerden df/avgdl im BM25 verfaelschen — also ALLE Scores, nicht
+        # nur die des Glossars.)
+        if EVAL_DIR.exists():
+            for gx in sorted(EVAL_DIR.glob("*.xlsx"), key=lambda p: p.name.lower()):
+                if _is_temp(gx.name):
+                    continue
+                had = conn.execute("SELECT COUNT(*) FROM chunks WHERE source=?",
+                                   (gx.name,)).fetchone()[0]
+                if had:
+                    conn.execute("DELETE FROM chunks WHERE source=?", (gx.name,))
+                    VECTORS[:] = [it for it in VECTORS if it["source"] != gx.name]
+                    rebuild_bm25()
+                before = len(report)
+                _ingest_one(conn, gx.name, str(gx), report, pending)
+                if len(report) > before and had:
+                    report[-1]["status"] += f" (Glossar aktualisiert, {had} alte Chunks ersetzt)"
+                elif len(report) > before:
+                    report[-1]["status"] += " (Glossar)"
         conn.commit()
         return jsonify({"report": report, "pending": pending})
     except Exception as e:
@@ -801,7 +1233,7 @@ def store_vectors():
         cid, vec = it.get("id"), it.get("vector")
         if cid is None or not vec: continue
         nv = l2_normalize(vec)
-        conn.execute("UPDATE chunks SET vec=? WHERE id=?", (json.dumps(nv), cid))
+        conn.execute("UPDATE chunks SET vec=? WHERE id=?", (vec_to_blob(nv), cid))
         row = conn.execute("SELECT source, text, tags FROM chunks WHERE id=?", (cid,)).fetchone()
         if row:
             VECTORS.append({"id": cid, "source": row["source"], "text": row["text"],
@@ -825,10 +1257,41 @@ def search():
     return jsonify({"hits": [{"source": it["source"], "text": it["text"], "score": round(s, 4)}
                              for s, it in top]})
 
+# --------------------------------------------------------------- Eval-Harness (optional)
+# Variante B: misst das ECHTE hybrid_search() gegen ein grosses Q/A-Set aus XLSX.
+# Bewusst OPTIONAL eingebunden: fehlt eval_module.py, laeuft tiseR unveraendert
+# weiter. Der Harness ist Messwerkzeug, kein Betriebsbestandteil — er darf den
+# Produktivstart niemals verhindern.
+# Registriert: /eval, /api/eval/load, /questions, /step, /report, /export, /compare
+try:
+    import eval_module
+    eval_module.register(app, globals())
+    log.info("Eval-Harness aktiv: http://localhost:%d/eval", PORT)
+except ImportError:
+    pass                      # eval_module.py nicht vorhanden -> Feature einfach aus
+except Exception as _ee:
+    log.warning("Eval-Harness nicht geladen (%s) — tiseR laeuft normal weiter.", _ee)
+
+# --------------------------------------------------------------- Anonymisierung (optional)
+# Markiert schuetzenswerte Stellen einer hochgeladenen Datei und ersetzt sie erst
+# nach manueller Freigabe. Nutzt extract_text_any() und _xlsx_rows() aus diesem
+# Modul; greift NICHT in Ingest, Index oder Retrieval ein — der Chat-Pfad bleibt
+# unberuehrt. Wie der Eval-Harness bewusst OPTIONAL: fehlt anon_module.py, startet
+# tiseR unveraendert.
+# Registriert: /anon, /api/anon/config, /api/anon/scan
+try:
+    import anon_module
+    anon_module.register(app, globals())
+    log.info("Anonymisierung aktiv: http://localhost:%d/anon", PORT)
+except ImportError:
+    pass                      # anon_module.py nicht vorhanden -> Feature einfach aus
+except Exception as _ae:
+    log.warning("Anonymisierung nicht geladen (%s) — tiseR laeuft normal weiter.", _ae)
+
 # ----------------------------------------------------------------
 if __name__ == "__main__":
     import traceback, socket
-    LOGFILE = APP_DIR / "armachat_error.log"
+    LOGFILE = APP_DIR / "tiser_error.log"
 
     def _fatal(msg):
         try:
@@ -838,7 +1301,7 @@ if __name__ == "__main__":
             pass
         print("\n" + msg)
         try:
-            input("\n[Enter] zum Schliessen — Fehler steht auch in armachat_error.log")
+            input("\n[Enter] zum Schliessen — Fehler steht auch in tiser_error.log")
         except Exception:
             pass
 
@@ -856,7 +1319,7 @@ if __name__ == "__main__":
         _probe.bind((HOST, PORT)); _probe.close()
     except OSError:
         _probe.close()
-        _fatal(f"Port {PORT} ist belegt — armachat laeuft vermutlich schon.\n"
+        _fatal(f"Port {PORT} ist belegt — tiseR laeuft vermutlich schon.\n"
                f"  -> Im Browser oeffnen:  http://localhost:{PORT}\n"
                f"  -> Oder alte python.exe im Task-Manager beenden und neu starten.")
         raise SystemExit(1)
@@ -871,7 +1334,7 @@ if __name__ == "__main__":
             pass  # nicht startrelevant; Seite manuell oeffnen
     threading.Thread(target=_browser, daemon=True).start()
 
-    log.info("armachat laeuft: http://localhost:%d  (zum Beenden dieses Fenster schliessen)", PORT)
+    log.info("tiseR laeuft: http://localhost:%d  (zum Beenden dieses Fenster schliessen)", PORT)
     try:
         app.run(host=HOST, port=PORT, debug=False, use_reloader=False)
     except Exception:
